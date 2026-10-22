@@ -1,0 +1,51 @@
+{
+  "generalLsp.servers": {
+    "gopls": {
+      "command": ["gopls"],
+      "languages": ["go"],
+      "rootMarkers": ["go.mod"],
+      "settings": { "gopls.hoverKind": "NoDocumentation" }
+    },
+    "clangd": {
+      "command": ["clangd"],
+      "filePatterns": ["*.c"]
+    },
+    "clangd-loose": {
+      "command": ["clangd"],
+      "filePatterns": ["*.cc"],
+      "rootMarkers": ["compile_commands.json"],
+      "fallbackRoot": "~/.cache/general-lsp-test/scratch",
+      "disabledCapabilities": ["documentSymbolProvider"]
+    },
+    "venv-probe": {
+      "command": ["glsp-venv-probe"],
+      "filePatterns": ["*.probe"],
+      "rootMarkers": ["pyproject.toml"],
+      "venv": true
+    }
+  },
+  "generalLsp.formatters": {
+    "upper": {
+      "command": ["glsp-upper"],
+      "filePatterns": ["*.up", "fmtme.c", "prefer.go"]
+    },
+    "not-installed": {
+      "command": ["glsp-no-such-formatter"],
+      "filePatterns": ["*.up"]
+    },
+    "suffix": {
+      "command": ["sed", "s/$/;/"],
+      "filePatterns": ["*.up"]
+    },
+    "in-place": {
+      "command": ["sh", "-c", "printf 'rewritten %s\\n' \"$(basename \"$0\" | cut -c1-12)\" > \"$0\"; exit 3", "${file}"],
+      "filePatterns": ["*.inplace"],
+      "stdin": false,
+      "exitCodes": [0, 3]
+    },
+    "broken": {
+      "command": ["sh", "-c", "exit 2"],
+      "filePatterns": ["*.broken"]
+    }
+  }
+}

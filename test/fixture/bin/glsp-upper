@@ -1,0 +1,2 @@
+#!/bin/sh
+exec tr a-z A-Z

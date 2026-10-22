@@ -1,0 +1,9 @@
+**
+!dist/extension.js
+!dist/watchdog.js
+!dist/webview/main.js
+!dist/webview/main.css
+!dist/webview/*.ttf
+!dist/webview/icon.svg
+!package.json
+!README.md

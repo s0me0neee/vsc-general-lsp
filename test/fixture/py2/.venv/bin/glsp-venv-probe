@@ -1,0 +1,4 @@
+#!/bin/sh
+# Only reachable when the venv is activated; records what the server process sees.
+echo "$VIRTUAL_ENV" > venv.out
+exec gopls

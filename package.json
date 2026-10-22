@@ -1,0 +1,312 @@
+{
+	"name": "general-lsp",
+	"displayName": "General LSP",
+	"description": "Attach any language server to any file, configured like nvim-lspconfig.",
+	"version": "0.0.8",
+	"publisher": "maot27",
+	"license": "MIT",
+	"engines": {
+		"vscode": "^1.91.0"
+	},
+	"categories": [
+		"Programming Languages",
+		"Linters",
+		"Formatters"
+	],
+	"main": "./dist/extension.js",
+	"activationEvents": [
+		"onStartupFinished"
+	],
+	"capabilities": {
+		"untrustedWorkspaces": {
+			"supported": "limited",
+			"description": "Workspace-level server definitions are ignored in untrusted workspaces because they run arbitrary commands.",
+			"restrictedConfigurations": [
+				"generalLsp.servers",
+				"generalLsp.formatters",
+				"generalLsp.extraPaths"
+			]
+		}
+	},
+	"contributes": {
+		"commands": [
+			{
+				"command": "generalLsp.restart",
+				"title": "Restart Server",
+				"category": "General LSP"
+			},
+			{
+				"command": "generalLsp.stop",
+				"title": "Stop Server",
+				"category": "General LSP"
+			},
+			{
+				"command": "generalLsp.openSettings",
+				"title": "Open Settings",
+				"category": "General LSP",
+				"icon": "$(settings-gear)"
+			},
+			{
+				"command": "generalLsp.reloadAll",
+				"title": "Reload Settings and Restart All Servers",
+				"category": "General LSP"
+			},
+			{
+				"command": "generalLsp.enable",
+				"title": "Enable Server…",
+				"category": "General LSP"
+			},
+			{
+				"command": "generalLsp.disable",
+				"title": "Disable Server…",
+				"category": "General LSP"
+			}
+		],
+		"configuration": {
+			"title": "General LSP",
+			"properties": {
+				"generalLsp.extraPaths": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"default": [],
+					"markdownDescription": "Directories searched after `PATH` for server and formatter commands, e.g. `[\"~/.local/share/nvim/mason/bin\"]`. Also appended to the processes' `PATH`."
+				},
+				"generalLsp.formatters": {
+					"type": "object",
+					"default": {},
+					"markdownDescription": "Command-line formatters keyed by name, like conform.nvim. Every formatter matching a file runs in settings order, each fed the previous one's output. Files with a matching formatter never use LSP formatting.",
+					"additionalProperties": {
+						"type": "object",
+						"required": [
+							"command"
+						],
+						"additionalProperties": false,
+						"properties": {
+							"enabled": {
+								"type": "boolean",
+								"default": true
+							},
+							"command": {
+								"type": "array",
+								"items": {
+									"type": "string"
+								},
+								"minItems": 1,
+								"markdownDescription": "Executable and arguments, e.g. `[\"stylua\", \"--stdin-filepath\", \"${file}\", \"-\"]`. Supports `${file}`, `${fileDirname}`, `${fileBasename}`, `${root}`, `${rootName}`, `${userHome}` and a leading `~`."
+							},
+							"languages": {
+								"type": "array",
+								"items": {
+									"type": "string"
+								},
+								"markdownDescription": "VS Code language IDs to format."
+							},
+							"filePatterns": {
+								"type": "array",
+								"items": {
+									"type": "string"
+								},
+								"markdownDescription": "Glob patterns matched against the file path; a bare `*.gleam` means `**/*.gleam`."
+							},
+							"rootMarkers": {
+								"type": "array",
+								"items": {
+									"oneOf": [
+										{
+											"type": "string"
+										},
+										{
+											"type": "array",
+											"items": {
+												"type": "string"
+											}
+										}
+									]
+								},
+								"markdownDescription": "Markers locating the working directory (`${root}`), same rules as servers. Defaults to the workspace folder, then the file's directory."
+							},
+							"requireRoot": {
+								"type": "boolean",
+								"default": false,
+								"markdownDescription": "Skip this formatter when no root marker is found (conform's `require_cwd`)."
+							},
+							"stdin": {
+								"type": "boolean",
+								"default": true,
+								"markdownDescription": "Feed the text on stdin and read the result from stdout. When `false`, `${file}` is a temporary sibling copy that the formatter rewrites in place."
+							},
+							"exitCodes": {
+								"type": "array",
+								"items": {
+									"type": "integer"
+								},
+								"default": [
+									0
+								],
+								"markdownDescription": "Exit codes that mean success."
+							},
+							"env": {
+								"type": "object",
+								"additionalProperties": {
+									"type": "string"
+								}
+							}
+						}
+					}
+				},
+				"generalLsp.servers": {
+					"type": "object",
+					"default": {},
+					"markdownDescription": "Language servers keyed by name. Each server attaches to documents matching `languages` or `filePatterns`.",
+					"additionalProperties": {
+						"type": "object",
+						"required": [
+							"command"
+						],
+						"additionalProperties": false,
+						"properties": {
+							"enabled": {
+								"type": "boolean",
+								"default": true,
+								"markdownDescription": "Set to `false` to turn the server off but keep its config; see **General LSP: Enable/Disable Server…**."
+							},
+							"command": {
+								"type": "array",
+								"items": {
+									"type": "string"
+								},
+								"minItems": 1,
+								"markdownDescription": "Executable and arguments, e.g. `[\"rust-analyzer\"]` or `[\"typescript-language-server\", \"--stdio\"]`. A leading `~` and `${userHome}` expand to the home directory; `${root}` and `${rootName}` to the resolved root and its basename."
+							},
+							"languages": {
+								"type": "array",
+								"items": {
+									"type": "string"
+								},
+								"markdownDescription": "VS Code language IDs to attach to, e.g. `[\"rust\"]`."
+							},
+							"filePatterns": {
+								"type": "array",
+								"items": {
+									"type": "string"
+								},
+								"markdownDescription": "Glob patterns matched against the file path, for files VS Code has no language for, e.g. `[\"**/*.zig\", \"**/*.zon\"]`."
+							},
+							"rootMarkers": {
+								"type": "array",
+								"items": {
+									"oneOf": [
+										{
+											"type": "string"
+										},
+										{
+											"type": "array",
+											"items": {
+												"type": "string"
+											}
+										}
+									]
+								},
+								"markdownDescription": "File or directory names (globs allowed, e.g. `*.csproj`) marking the project root, in priority order; a nested array groups markers of equal priority. Without markers the workspace folder is the root."
+							},
+							"singleFileSupport": {
+								"type": "boolean",
+								"default": true,
+								"markdownDescription": "Attach even when no root marker is found, using the workspace folder or the file's directory as root."
+							},
+							"settings": {
+								"type": "object",
+								"markdownDescription": "Served to `workspace/configuration` requests and sent via `workspace/didChangeConfiguration`."
+							},
+							"initializationOptions": {
+								"markdownDescription": "Passed verbatim as `initializationOptions` in the `initialize` request."
+							},
+							"env": {
+								"type": "object",
+								"additionalProperties": {
+									"type": "string"
+								},
+								"markdownDescription": "Extra environment variables for the server process. Values support the same variables as `command`."
+							},
+							"fallbackRoot": {
+								"type": "string",
+								"markdownDescription": "Root for files where no root marker is found, instead of the workspace folder or file's directory. Created if missing. Useful to stop a server indexing the parent of a scratch file."
+							},
+							"disabledCapabilities": {
+								"type": "array",
+								"items": {
+									"type": "string"
+								},
+								"markdownDescription": "Server capabilities to strip from the `initialize` result, e.g. `[\"codeActionProvider\"]`, like setting `client.server_capabilities.X = false` in `on_init`."
+							},
+							"format": {
+								"type": "string",
+								"enum": [
+									"fallback",
+									"prefer",
+									"never"
+								],
+								"default": "fallback",
+								"markdownEnumDescriptions": [
+									"Format only files no `generalLsp.formatters` entry matches.",
+									"Format its files even when a CLI formatter matches, and win over other servers.",
+									"Never use this server for formatting."
+								],
+								"markdownDescription": "How this server's formatter competes with `generalLsp.formatters`, like conform's `lsp_format`."
+							},
+							"venv": {
+								"oneOf": [
+									{
+										"type": "boolean"
+									},
+									{
+										"type": "array",
+										"items": {
+											"type": "string"
+										}
+									}
+								],
+								"markdownDescription": "Launch the server as if the nearest Python virtualenv were activated: `VIRTUAL_ENV` set, its `bin` first on `PATH` (also used to resolve `command`). `true` searches the root and its parents for `.venv`, `venv`, `env`; an array gives other folder names. Roots with different venvs never share a process."
+							},
+							"multiRoot": {
+								"type": "boolean",
+								"default": true,
+								"markdownDescription": "Add newly found roots to a running client as workspace folders (when the server supports it) instead of starting another process. `false` gives nvim's default: one client per root."
+							}
+						}
+					}
+				}
+			}
+		}
+	},
+	"scripts": {
+		"build": "bun run build:ext && bun run build:web && bun run build:assets",
+		"watch": "bun run build:assets && (bun run build:ext --watch & bun run build:web --watch)",
+		"typecheck": "tsc --noEmit && tsc --noEmit -p src/webview",
+		"package": "bun run build:ext --minify && bun run build:web --minify && bun run build:assets && vsce package --no-dependencies",
+		"test": "bun run build && node test/run.mjs",
+		"build:ext": "esbuild src/extension.ts src/watchdog.ts --bundle --platform=node --format=cjs --target=node20 --external:vscode --outdir=dist --sourcemap",
+		"build:web": "esbuild src/webview/main.tsx src/webview/main.css --bundle --platform=browser --format=iife --target=chrome120 --jsx=automatic --jsx-import-source=preact --loader:.ttf=file --outdir=dist/webview --sourcemap",
+		"build:assets": "mkdir -p dist/webview && cp src/webview/icon.svg dist/webview/"
+	},
+	"dependencies": {
+		"@vscode/codicons": "0.0.46-24",
+		"picomatch": "4.0.7",
+		"preact": "10.29.8",
+		"vscode-languageclient": "11.0.0",
+		"which": "7.0.0"
+	},
+	"devDependencies": {
+		"@types/node": "22",
+		"@types/picomatch": "^4.0.3",
+		"@types/vscode": "1.91.0",
+		"@types/vscode-webview": "^1.57.5",
+		"@types/which": "^3.0.4",
+		"@vscode/test-electron": "^3.1.0",
+		"@vscode/vsce": "^4.0.0",
+		"esbuild": "^0.28.2",
+		"typescript": "7.0.2"
+	}
+}
