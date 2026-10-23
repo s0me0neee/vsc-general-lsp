@@ -9,80 +9,98 @@ const root = path.resolve(import.meta.dirname, "..");
 const straggler = "sleep 86399";
 
 async function launch(mode) {
-  // Tests mutate workspace settings, so run against a throwaway copy of the fixture.
-  const workspace = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "general-lsp-")));
-  fs.cpSync(path.join(root, "test/fixture"), workspace, { recursive: true });
-  const settingsPath = path.join(workspace, ".vscode/settings.json");
-  const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
-  const servers = settings["generalLsp.servers"];
-  servers.gopls.command = [
-    "sh",
-    "-c",
-    `echo $$ > server.pid; echo "$0" > root.name; echo glsp-stderr-marker >&2; trap '' TERM HUP; ${straggler} & exec gopls`,
-    "${rootName}",
-  ];
-  servers["clangd-loose"].fallbackRoot = path.join(workspace, "scratch-root");
-  settings["generalLsp.extraPaths"] = [path.join(workspace, "bin")];
-  fs.writeFileSync(settingsPath, JSON.stringify(settings));
+	// Tests mutate workspace settings, so run against a throwaway copy of the fixture.
+	const workspace = fs.realpathSync(
+		fs.mkdtempSync(path.join(os.tmpdir(), "general-lsp-")),
+	);
+	fs.cpSync(path.join(root, "test/fixture"), workspace, { recursive: true });
+	const settingsPath = path.join(workspace, ".vscode/settings.json");
+	const settings = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
+	const servers = settings["generalLsp.servers"];
+	servers.gopls.command = [
+		"sh",
+		"-c",
+		`echo $$ > server.pid; echo "$0" > root.name; echo glsp-stderr-marker >&2; trap '' TERM HUP; ${straggler} & exec gopls`,
+		"${rootName}",
+	];
+	servers["clangd-loose"].fallbackRoot = path.join(workspace, "scratch-root");
+	settings["generalLsp.extraPaths"] = [path.join(workspace, "bin")];
+	fs.writeFileSync(settingsPath, JSON.stringify(settings));
 
-  let ok = true;
-  try {
-    await runTests({
-      vscodeExecutablePath: process.env.VSCODE_PATH,
-      extensionDevelopmentPath: root,
-      extensionTestsPath: path.join(root, "test/suite.cjs"),
-      extensionTestsEnv: { FIXTURE: workspace, MODE: mode, ONLY: process.env.ONLY ?? "", DEBUG_TESTS: process.env.DEBUG_TESTS ?? "" },
-      launchArgs: [workspace, "--disable-extensions", "--disable-workspace-trust"],
-    });
-  } catch {
-    // Killing the extension host on purpose makes the run "fail".
-    ok = mode === "kill";
-  }
-  try {
-    // An ONLY= run may never start gopls; then only the stragglers are checked.
-    const pidFile = path.join(workspace, "gomod/server.pid");
-    const serverPid = fs.existsSync(pidFile) ? Number(fs.readFileSync(pidFile, "utf8")) : 0;
-    ok = (await serversGone(serverPid, mode)) && ok;
-  } finally {
-    fs.rmSync(workspace, { recursive: true, force: true });
-  }
-  return ok;
+	let ok = true;
+	try {
+		await runTests({
+			vscodeExecutablePath: process.env.VSCODE_PATH,
+			extensionDevelopmentPath: root,
+			extensionTestsPath: path.join(root, "test/suite.cjs"),
+			extensionTestsEnv: {
+				FIXTURE: workspace,
+				MODE: mode,
+				ONLY: process.env.ONLY ?? "",
+				DEBUG_TESTS: process.env.DEBUG_TESTS ?? "",
+			},
+			launchArgs: [
+				workspace,
+				"--disable-extensions",
+				"--disable-workspace-trust",
+			],
+		});
+	} catch {
+		// Killing the extension host on purpose makes the run "fail".
+		ok = mode === "kill";
+	}
+	try {
+		// An ONLY= run may never start gopls; then only the stragglers are checked.
+		const pidFile = path.join(workspace, "gomod/server.pid");
+		const serverPid = fs.existsSync(pidFile)
+			? Number(fs.readFileSync(pidFile, "utf8"))
+			: 0;
+		ok = (await serversGone(serverPid, mode)) && ok;
+	} finally {
+		fs.rmSync(workspace, { recursive: true, force: true });
+	}
+	return ok;
 }
 
 async function serversGone(serverPid, mode) {
-  const deadline = Date.now() + 5000;
-  while (Date.now() < deadline) {
-    if (!isAlive(serverPid) && stragglers().length === 0) {
-      console.log(`  ✓ servers are gone after ${mode}`);
-      return true;
-    }
-    await new Promise((r) => setTimeout(r, 200));
-  }
-  console.log(`  ✗ servers survived ${mode}: server ${isAlive(serverPid) ? "alive" : "dead"}, stragglers ${stragglers()}`);
-  for (const pid of [serverPid, ...stragglers()]) {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {}
-  }
-  return false;
+	const deadline = Date.now() + 5000;
+	while (Date.now() < deadline) {
+		if (!isAlive(serverPid) && stragglers().length === 0) {
+			console.log(`  ✓ servers are gone after ${mode}`);
+			return true;
+		}
+		await new Promise((r) => setTimeout(r, 200));
+	}
+	console.log(
+		`  ✗ servers survived ${mode}: server ${isAlive(serverPid) ? "alive" : "dead"}, stragglers ${stragglers()}`,
+	);
+	for (const pid of [serverPid, ...stragglers()]) {
+		try {
+			process.kill(pid, "SIGKILL");
+		} catch {}
+	}
+	return false;
 }
 
 function isAlive(pid) {
-  if (!pid) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+	if (!pid) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 function stragglers() {
-  try {
-    return execFileSync("pgrep", ["-f", `^${straggler}$`], { encoding: "utf8" }).split("\n").filter(Boolean).map(Number);
-  } catch {
-    return [];
-  }
+	try {
+		return execFileSync("pgrep", ["-f", `^${straggler}$`], { encoding: "utf8" })
+			.split("\n")
+			.filter(Boolean)
+			.map(Number);
+	} catch {
+		return [];
+	}
 }
 
 const results = [await launch("quit"), await launch("kill")];

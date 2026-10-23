@@ -1,42 +1,49 @@
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as vscode from "vscode";
 import { State } from "vscode-languageclient/node";
-import * as os from "node:os";
 import * as clients from "../clients";
-import { expandHome, expandRootVars, isPlainObject, normalizePatterns, readServers, withExtraPaths } from "../config";
+import {
+	expandHome,
+	expandRootVars,
+	isPlainObject,
+	normalizePatterns,
+	readServers,
+	withExtraPaths,
+} from "../config";
 import { findExecutable, isProjectRelative } from "../executables";
 import { formatPlan } from "../formatting";
 import * as logs from "../logs";
 import * as notify from "../notify";
 import { isInside } from "../root";
 import type {
-    BufferInfo,
-    BufferServer,
-    ClientInfo,
-    Entry,
-    HostMessage,
-    Kind,
-    LogLine,
-    ProcessInfo,
-    Raw,
-    Status,
-    UiMessage,
-    UiState,
+	BufferInfo,
+	BufferServer,
+	ClientInfo,
+	Entry,
+	HostMessage,
+	Kind,
+	LogLine,
+	ProcessInfo,
+	Raw,
+	Status,
+	UiMessage,
+	UiState,
 } from "./protocol";
 import * as store from "./store";
 
 export interface PanelActions {
-    reloadAll(): Promise<void>;
-    restartServer(name: string): Promise<void>;
-    stopServer(name: string): Promise<void>;
-    // Attach open files again, starting whatever servers they now need.
-    reattach(): void;
+	reloadAll(): Promise<void>;
+	restartServer(name: string): Promise<void>;
+	stopServer(name: string): Promise<void>;
+	// Attach open files again, starting whatever servers they now need.
+	reattach(): void;
 }
 
 interface Session {
-    post(message: HostMessage): void;
-    watchLog(server: string | undefined): void;
+	post(message: HostMessage): void;
+	watchLog(server: string | undefined): void;
 }
 
 let panel: vscode.WebviewPanel | undefined;
@@ -45,365 +52,480 @@ let pendingTab: string | undefined;
 
 // Lets tests drive the same handlers the webview uses, without a webview.
 export function dispatch(message: UiMessage): Promise<void> {
-    if (!lastActions) throw new Error("Settings panel was never opened");
-    return handle(message, lastActions, { post: () => {}, watchLog: () => {} });
+	if (!lastActions) throw new Error("Settings panel was never opened");
+	return handle(message, lastActions, { post: () => {}, watchLog: () => {} });
 }
 // Incremented when the webview script has booted, which proves it runs under the CSP.
 let readyCount = 0;
 
 export function webviewReadyCount(): number {
-    return readyCount;
+	return readyCount;
 }
 
-export function openSettingsPanel(extensionUri: vscode.Uri, actions: PanelActions, tab?: string): vscode.WebviewPanel {
-    lastActions = actions;
-    if (panel) {
-        panel.reveal();
-        if (tab) void panel.webview.postMessage({ type: "showTab", tab } satisfies HostMessage);
-        return panel;
-    }
-    // A brand-new webview can't receive messages until its script has booted; send the tab on "ready".
-    pendingTab = tab;
-    const webviewRoot = vscode.Uri.joinPath(extensionUri, "dist", "webview");
-    const created = vscode.window.createWebviewPanel("generalLsp.settings", "General LSP", vscode.ViewColumn.Active, {
-        enableScripts: true,
-        retainContextWhenHidden: true,
-        localResourceRoots: [webviewRoot],
-    });
-    panel = created;
-    created.iconPath = vscode.Uri.joinPath(extensionUri, "dist", "webview", "icon.svg");
-    created.webview.html = html(created.webview, webviewRoot);
+export function openSettingsPanel(
+	extensionUri: vscode.Uri,
+	actions: PanelActions,
+	tab?: string,
+): vscode.WebviewPanel {
+	lastActions = actions;
+	if (panel) {
+		panel.reveal();
+		if (tab)
+			void panel.webview.postMessage({
+				type: "showTab",
+				tab,
+			} satisfies HostMessage);
+		return panel;
+	}
+	// A brand-new webview can't receive messages until its script has booted; send the tab on "ready".
+	pendingTab = tab;
+	const webviewRoot = vscode.Uri.joinPath(extensionUri, "dist", "webview");
+	const created = vscode.window.createWebviewPanel(
+		"generalLsp.settings",
+		"General LSP",
+		vscode.ViewColumn.Active,
+		{
+			enableScripts: true,
+			retainContextWhenHidden: true,
+			localResourceRoots: [webviewRoot],
+		},
+	);
+	panel = created;
+	created.iconPath = vscode.Uri.joinPath(
+		extensionUri,
+		"dist",
+		"webview",
+		"icon.svg",
+	);
+	created.webview.html = html(created.webview, webviewRoot);
 
-    // Server state flips several times per start; one update per burst is enough.
-    let timer: NodeJS.Timeout | undefined;
-    // Building the state touches the filesystem, so a hidden panel only notes that it is stale.
-    let stale = false;
-    const post = (message: HostMessage) => void created.webview.postMessage(message);
-    const postState = () => {
-        clearTimeout(timer);
-        if (!created.visible) {
-            stale = true;
-            return;
-        }
-        timer = setTimeout(() => post({ type: "state", state: uiState() }), 50);
-    };
+	// Server state flips several times per start; one update per burst is enough.
+	let timer: NodeJS.Timeout | undefined;
+	// Building the state touches the filesystem, so a hidden panel only notes that it is stale.
+	let stale = false;
+	const post = (message: HostMessage) =>
+		void created.webview.postMessage(message);
+	const postState = () => {
+		clearTimeout(timer);
+		if (!created.visible) {
+			stale = true;
+			return;
+		}
+		timer = setTimeout(() => post({ type: "state", state: uiState() }), 50);
+	};
 
-    // Only the log on screen streams; chatty servers would otherwise flood the webview.
-    let watched: string | undefined;
-    let pending: LogLine[] = [];
-    let logTimer: NodeJS.Timeout | undefined;
-    const flushLog = () => {
-        logTimer = undefined;
-        if (watched && pending.length > 0) post({ type: "log", server: watched, lines: pending, reset: false });
-        pending = [];
-    };
-    const session: Session = {
-        post,
-        watchLog: (server) => {
-            watched = server;
-            pending = [];
-            if (server) post({ type: "log", server, lines: logs.lines(server).slice(-2000), reset: true });
-        },
-    };
+	// Only the log on screen streams; chatty servers would otherwise flood the webview.
+	let watched: string | undefined;
+	let pending: LogLine[] = [];
+	let logTimer: NodeJS.Timeout | undefined;
+	const flushLog = () => {
+		logTimer = undefined;
+		if (watched && pending.length > 0)
+			post({ type: "log", server: watched, lines: pending, reset: false });
+		pending = [];
+	};
+	const session: Session = {
+		post,
+		watchLog: (server) => {
+			watched = server;
+			pending = [];
+			if (server)
+				post({
+					type: "log",
+					server,
+					lines: logs.lines(server).slice(-2000),
+					reset: true,
+				});
+		},
+	};
 
-    const subscriptions = [
-        logs.onDidAppend(({ name, lines }) => {
-            if (name !== watched) return;
-            pending.push(...lines);
-            logTimer ??= setTimeout(flushLog, 100);
-        }),
-        clients.onDidChange(postState),
-        notify.onDidChange(postState),
-        created.onDidChangeViewState(() => {
-            if (created.visible && stale) {
-                stale = false;
-                postState();
-            }
-        }),
-        vscode.workspace.onDidChangeConfiguration((e) => {
-            if (e.affectsConfiguration("generalLsp")) postState();
-        }),
-        // The Buffers tab follows what is open and focused.
-        vscode.workspace.onDidOpenTextDocument(postState),
-        vscode.workspace.onDidCloseTextDocument(postState),
-        vscode.window.onDidChangeActiveTextEditor(postState),
-        vscode.window.tabGroups.onDidChangeTabs(postState),
-        created.webview.onDidReceiveMessage(async (message: UiMessage) => {
-            try {
-                if (message.type === "ready") {
-                    readyCount++;
-                    post({ type: "state", state: uiState() });
-                    if (pendingTab) post({ type: "showTab", tab: pendingTab });
-                    pendingTab = undefined;
-                }
-                else await handle(message, actions, session);
-            } catch (err) {
-                post({ type: "error", message: notify.errorText(err) });
-                notify.error("settings UI", err, `'${message.type}' failed`);
-            }
-        }),
-    ];
-    created.onDidDispose(() => {
-        clearTimeout(timer);
-        clearTimeout(logTimer);
-        subscriptions.forEach((s) => s.dispose());
-        panel = undefined;
-    });
-    return created;
+	const subscriptions = [
+		logs.onDidAppend(({ name, lines }) => {
+			if (name !== watched) return;
+			pending.push(...lines);
+			logTimer ??= setTimeout(flushLog, 100);
+		}),
+		clients.onDidChange(postState),
+		notify.onDidChange(postState),
+		created.onDidChangeViewState(() => {
+			if (created.visible && stale) {
+				stale = false;
+				postState();
+			}
+		}),
+		vscode.workspace.onDidChangeConfiguration((e) => {
+			if (e.affectsConfiguration("generalLsp")) postState();
+		}),
+		// The Buffers tab follows what is open and focused.
+		vscode.workspace.onDidOpenTextDocument(postState),
+		vscode.workspace.onDidCloseTextDocument(postState),
+		vscode.window.onDidChangeActiveTextEditor(postState),
+		vscode.window.tabGroups.onDidChangeTabs(postState),
+		created.webview.onDidReceiveMessage(async (message: UiMessage) => {
+			try {
+				if (message.type === "ready") {
+					readyCount++;
+					post({ type: "state", state: uiState() });
+					if (pendingTab) post({ type: "showTab", tab: pendingTab });
+					pendingTab = undefined;
+				} else await handle(message, actions, session);
+			} catch (err) {
+				post({ type: "error", message: notify.errorText(err) });
+				notify.error("settings UI", err, `'${message.type}' failed`);
+			}
+		}),
+	];
+	created.onDidDispose(() => {
+		clearTimeout(timer);
+		clearTimeout(logTimer);
+		subscriptions.forEach((s) => s.dispose());
+		panel = undefined;
+	});
+	return created;
 }
 
-async function handle(message: UiMessage, actions: PanelActions, session: Session): Promise<void> {
-    switch (message.type) {
-        case "save":
-            await store.saveEntry(message.kind, message.scope, message.name, message.raw, message.previousName);
-            session.post({ type: "saved", kind: message.kind, name: message.name });
-            return;
-        case "watchLog":
-            return session.watchLog(message.server);
-        case "clearLog":
-            logs.clear(message.server);
-            return session.watchLog(message.server);
-        case "stopProcess": {
-            const rc = clients.runningClients().find((c) => c.id === message.id);
-            if (rc) await clients.stop(rc);
-            return;
-        }
-        case "restartProcess": {
-            const rc = clients.runningClients().find((c) => c.id === message.id);
-            if (rc) await clients.stop(rc);
-            return actions.reattach();
-        }
-        case "delete": {
-            const choice = await vscode.window.showWarningMessage(
-                `Delete ${message.kind} '${message.name}' from settings.json?`,
-                { modal: true },
-                "Delete",
-            );
-            if (choice) await store.deleteEntry(message.kind, message.name);
-            return;
-        }
-        case "move":
-            return store.moveEntry(message.kind, message.name, message.delta);
-        case "setEnabled":
-            return store.setEnabled(message.kind, message.name, message.enabled);
-        case "restart":
-            return actions.restartServer(message.name);
-        case "stop":
-            return actions.stopServer(message.name);
-        case "reloadAll":
-            return actions.reloadAll();
-        case "showOutput":
-            return clients.output(message.name).show();
-        case "openJson":
-            await vscode.commands.executeCommand("workbench.action.openSettingsJson");
-            return;
-        case "openFile":
-            // Beside the panel, so the Buffers tab stays visible.
-            await vscode.window.showTextDocument(vscode.Uri.parse(message.uri), { viewColumn: vscode.ViewColumn.Beside });
-            return;
-        case "saveExtraPaths":
-            return store.saveExtraPaths(message.paths);
-        case "seenNotices":
-            notify.markSeen();
-            return session.post({ type: "noticesSeen" });
-        case "clearNotices":
-            return notify.clear();
-        case "showLog":
-            return notify.log().show();
-        case "checkPaths":
-            session.post({
-                type: "pathsChecked",
-                exists: Object.fromEntries(message.paths.map((p) => [p, fs.existsSync(expandHome(p))])),
-            });
-            return;
-    }
+async function handle(
+	message: UiMessage,
+	actions: PanelActions,
+	session: Session,
+): Promise<void> {
+	switch (message.type) {
+		case "save":
+			await store.saveEntry(
+				message.kind,
+				message.scope,
+				message.name,
+				message.raw,
+				message.previousName,
+			);
+			session.post({ type: "saved", kind: message.kind, name: message.name });
+			return;
+		case "watchLog":
+			return session.watchLog(message.server);
+		case "clearLog":
+			logs.clear(message.server);
+			return session.watchLog(message.server);
+		case "stopProcess": {
+			const rc = clients.runningClients().find((c) => c.id === message.id);
+			if (rc) await clients.stop(rc);
+			return;
+		}
+		case "restartProcess": {
+			const rc = clients.runningClients().find((c) => c.id === message.id);
+			if (rc) await clients.stop(rc);
+			return actions.reattach();
+		}
+		case "delete": {
+			const choice = await vscode.window.showWarningMessage(
+				`Delete ${message.kind} '${message.name}' from settings.json?`,
+				{ modal: true },
+				"Delete",
+			);
+			if (choice) await store.deleteEntry(message.kind, message.name);
+			return;
+		}
+		case "move":
+			return store.moveEntry(message.kind, message.name, message.delta);
+		case "setEnabled":
+			return store.setEnabled(message.kind, message.name, message.enabled);
+		case "restart":
+			return actions.restartServer(message.name);
+		case "stop":
+			return actions.stopServer(message.name);
+		case "reloadAll":
+			return actions.reloadAll();
+		case "showOutput":
+			return clients.output(message.name).show();
+		case "openJson":
+			await vscode.commands.executeCommand("workbench.action.openSettingsJson");
+			return;
+		case "openFile":
+			// Beside the panel, so the Buffers tab stays visible.
+			await vscode.window.showTextDocument(vscode.Uri.parse(message.uri), {
+				viewColumn: vscode.ViewColumn.Beside,
+			});
+			return;
+		case "saveExtraPaths":
+			return store.saveExtraPaths(message.paths);
+		case "seenNotices":
+			notify.markSeen();
+			return session.post({ type: "noticesSeen" });
+		case "clearNotices":
+			return notify.clear();
+		case "showLog":
+			return notify.log().show();
+		case "checkPaths":
+			session.post({
+				type: "pathsChecked",
+				exists: Object.fromEntries(
+					message.paths.map((p) => [p, fs.existsSync(expandHome(p))]),
+				),
+			});
+			return;
+	}
 }
 
 export function uiState(): UiState {
-    const extraPaths = vscode.workspace.getConfiguration("generalLsp").get<string[]>("extraPaths", []);
-    return {
-        servers: store.entries("server").map((e) => entry("server", e.name, e.scope, e.raw)),
-        formatters: store.entries("formatter").map((e) => entry("formatter", e.name, e.scope, e.raw)),
-        buffers: buffers(),
-        processes: processes(),
-        notices: notify.list(),
-        unseenNotices: notify.unseenCount(),
-        unseenSeverity: notify.unseenSeverity(),
-        extraPaths: extraPaths.map((p) => ({ path: p, exists: fs.existsSync(expandHome(p)) })),
-        hasWorkspace: (vscode.workspace.workspaceFolders?.length ?? 0) > 0,
-    };
+	const extraPaths = vscode.workspace
+		.getConfiguration("generalLsp")
+		.get<string[]>("extraPaths", []);
+	return {
+		servers: store
+			.entries("server")
+			.map((e) => entry("server", e.name, e.scope, e.raw)),
+		formatters: store
+			.entries("formatter")
+			.map((e) => entry("formatter", e.name, e.scope, e.raw)),
+		buffers: buffers(),
+		processes: processes(),
+		notices: notify.list(),
+		unseenNotices: notify.unseenCount(),
+		unseenSeverity: notify.unseenSeverity(),
+		extraPaths: extraPaths.map((p) => ({
+			path: p,
+			exists: fs.existsSync(expandHome(p)),
+		})),
+		hasWorkspace: (vscode.workspace.workspaceFolders?.length ?? 0) > 0,
+	};
 }
 
 function buffers(): BufferInfo[] {
-    const active = vscode.window.activeTextEditor?.document.uri.toString();
-    const inTabs = new Set(
-        vscode.window.tabGroups.all
-            .flatMap((g) => g.tabs)
-            .map((t) => (t.input instanceof vscode.TabInputText ? t.input.uri.toString() : undefined)),
-    );
-    const configured = readServers();
-    const entries = store.entries("server");
-    const list = vscode.workspace.textDocuments
-        .filter((doc) => doc.uri.scheme === "file")
-        .map((doc): BufferInfo => {
-            const uri = doc.uri.toString();
-            return {
-                uri,
-                path: displayPath(doc.uri),
-                language: doc.languageId,
-                active: uri === active,
-                hidden: !inTabs.has(uri),
-                servers: entries.flatMap((e) => bufferServer(doc, e.name, e.raw, configured)),
-                format: formatPlan(doc),
-            };
-        });
-    // Focused file first, then what's in tabs, then hidden buffers.
-    const rank = (b: BufferInfo) => (b.active ? 0 : b.hidden ? 2 : 1);
-    return list.sort((a, b) => rank(a) - rank(b) || a.path.localeCompare(b.path));
+	const active = vscode.window.activeTextEditor?.document.uri.toString();
+	const inTabs = new Set(
+		vscode.window.tabGroups.all
+			.flatMap((g) => g.tabs)
+			.map((t) =>
+				t.input instanceof vscode.TabInputText
+					? t.input.uri.toString()
+					: undefined,
+			),
+	);
+	const configured = readServers();
+	const entries = store.entries("server");
+	const list = vscode.workspace.textDocuments
+		.filter((doc) => doc.uri.scheme === "file")
+		.map((doc): BufferInfo => {
+			const uri = doc.uri.toString();
+			return {
+				uri,
+				path: displayPath(doc.uri),
+				language: doc.languageId,
+				active: uri === active,
+				hidden: !inTabs.has(uri),
+				servers: entries.flatMap((e) =>
+					bufferServer(doc, e.name, e.raw, configured),
+				),
+				format: formatPlan(doc),
+			};
+		});
+	// Focused file first, then what's in tabs, then hidden buffers.
+	const rank = (b: BufferInfo) => (b.active ? 0 : b.hidden ? 2 : 1);
+	return list.sort((a, b) => rank(a) - rank(b) || a.path.localeCompare(b.path));
 }
 
 function bufferServer(
-    doc: vscode.TextDocument,
-    name: string,
-    raw: Raw,
-    configured: ReturnType<typeof readServers>,
+	doc: vscode.TextDocument,
+	name: string,
+	raw: Raw,
+	configured: ReturnType<typeof readServers>,
 ): BufferServer[] {
-    const filters = {
-        languages: asStrings(raw.languages),
-        filePatterns: normalizePatterns(asStrings(raw.filePatterns)),
-    };
-    if (!clients.matches(filters, doc)) return [];
-    const rc = clients.clientsFor(doc).find((c) => c.server.name === name);
-    if (rc) {
-        const state = rc.client.state === State.Running ? "running" : rc.client.state === State.Starting ? "starting" : "stopped";
-        // The folder that owns this file, i.e. the longest one containing it (or the fallback root).
-        const root =
-            rc.folders.filter((f) => isInside(doc.uri.fsPath, f)).sort((a, b) => b.length - a.length)[0] ?? rc.root;
-        return [{ name, state, root: tildify(root), venv: rc.venv && tildify(rc.venv) }];
-    }
-    if (raw.enabled === false) return [{ name, state: "disabled" }];
-    if (resolveBinary(raw) === null) return [{ name, state: "missing" }];
-    const server = configured.get(name);
-    if (server && !clients.hasRoot(server, doc.uri)) return [{ name, state: "noRoot" }];
-    return [{ name, state: "pending" }];
+	const filters = {
+		languages: asStrings(raw.languages),
+		filePatterns: normalizePatterns(asStrings(raw.filePatterns)),
+	};
+	if (!clients.matches(filters, doc)) return [];
+	const rc = clients.clientsFor(doc).find((c) => c.server.name === name);
+	if (rc) {
+		const state =
+			rc.client.state === State.Running
+				? "running"
+				: rc.client.state === State.Starting
+					? "starting"
+					: "stopped";
+		// The folder that owns this file, i.e. the longest one containing it (or the fallback root).
+		const root =
+			rc.folders
+				.filter((f) => isInside(doc.uri.fsPath, f))
+				.sort((a, b) => b.length - a.length)[0] ?? rc.root;
+		return [
+			{ name, state, root: tildify(root), venv: rc.venv && tildify(rc.venv) },
+		];
+	}
+	if (raw.enabled === false) return [{ name, state: "disabled" }];
+	if (resolveBinary(raw) === null) return [{ name, state: "missing" }];
+	const server = configured.get(name);
+	if (server && !clients.hasRoot(server, doc.uri))
+		return [{ name, state: "noRoot" }];
+	return [{ name, state: "pending" }];
 }
 
 function displayPath(uri: vscode.Uri): string {
-    const relative = vscode.workspace.asRelativePath(uri, (vscode.workspace.workspaceFolders?.length ?? 0) > 1);
-    return relative === uri.fsPath ? tildify(uri.fsPath) : relative;
+	const relative = vscode.workspace.asRelativePath(
+		uri,
+		(vscode.workspace.workspaceFolders?.length ?? 0) > 1,
+	);
+	return relative === uri.fsPath ? tildify(uri.fsPath) : relative;
 }
 
 function tildify(p: string): string {
-    const home = os.homedir();
-    return p === home || p.startsWith(home + "/") ? "~" + p.slice(home.length) : p;
+	const home = os.homedir();
+	return p === home || p.startsWith(home + "/")
+		? "~" + p.slice(home.length)
+		: p;
 }
 
 function asStrings(v: unknown): string[] {
-    return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+	return Array.isArray(v)
+		? v.filter((x): x is string => typeof x === "string")
+		: [];
 }
 
 function processes(): ProcessInfo[] {
-    return clients
-        .runningClients()
-        .map(
-            (rc): ProcessInfo => ({
-                id: rc.id,
-                server: rc.server.name,
-                state: clientState(rc),
-                pid: rc.pid,
-                startedAt: rc.startedAt,
-                restarts: rc.restarts,
-                argv: rc.argv,
-                cwd: tildify(rc.root),
-                venv: rc.venv && tildify(rc.venv),
-                folders: rc.folders.map(tildify),
-                files: [...rc.docs].map((uri) => ({ uri, path: displayPath(vscode.Uri.parse(uri)) })),
-                capabilities: rc.advertised,
-                disabled: rc.server.disabledCapabilities,
-                config: effectiveConfig(rc),
-            }),
-        )
-        .sort((a, b) => a.server.localeCompare(b.server) || a.id - b.id);
+	return clients
+		.runningClients()
+		.map(
+			(rc): ProcessInfo => ({
+				id: rc.id,
+				server: rc.server.name,
+				state: clientState(rc),
+				pid: rc.pid,
+				startedAt: rc.startedAt,
+				restarts: rc.restarts,
+				argv: rc.argv,
+				cwd: tildify(rc.root),
+				venv: rc.venv && tildify(rc.venv),
+				folders: rc.folders.map(tildify),
+				files: [...rc.docs].map((uri) => ({
+					uri,
+					path: displayPath(vscode.Uri.parse(uri)),
+				})),
+				capabilities: rc.advertised,
+				disabled: rc.server.disabledCapabilities,
+				config: effectiveConfig(rc),
+			}),
+		)
+		.sort((a, b) => a.server.localeCompare(b.server) || a.id - b.id);
 }
 
 // The server's settings as this one process sees them: per-root variables expanded, venv applied.
 function effectiveConfig(rc: clients.RunningClient): Raw {
-    const s = rc.server;
-    const config: Raw = {
-        command: rc.argv,
-        cwd: rc.root,
-        venv: rc.venv,
-        env: withInheritedPath(rc.envOverrides),
-        languages: s.languages,
-        filePatterns: s.filePatterns,
-        rootMarkers: s.rootMarkers,
-        singleFileSupport: s.singleFileSupport,
-        multiRoot: s.multiRoot,
-        fallbackRoot: s.fallbackRoot,
-        format: s.format,
-        disabledCapabilities: s.disabledCapabilities,
-        initializationOptions: expandRootVars(s.initializationOptions, rc.root),
-        settings: expandRootVars(s.settings, rc.root),
-    };
-    return Object.fromEntries(
-        Object.entries(config).filter(
-            ([, v]) =>
-                v !== undefined &&
-                !(Array.isArray(v) && v.length === 0) &&
-                !(v !== null && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length === 0),
-        ),
-    );
+	const s = rc.server;
+	const config: Raw = {
+		command: rc.argv,
+		cwd: rc.root,
+		venv: rc.venv,
+		env: withInheritedPath(rc.envOverrides),
+		languages: s.languages,
+		filePatterns: s.filePatterns,
+		rootMarkers: s.rootMarkers,
+		singleFileSupport: s.singleFileSupport,
+		multiRoot: s.multiRoot,
+		fallbackRoot: s.fallbackRoot,
+		format: s.format,
+		disabledCapabilities: s.disabledCapabilities,
+		initializationOptions: expandRootVars(s.initializationOptions, rc.root),
+		settings: expandRootVars(s.settings, rc.root),
+	};
+	return Object.fromEntries(
+		Object.entries(config).filter(
+			([, v]) =>
+				v !== undefined &&
+				!(Array.isArray(v) && v.length === 0) &&
+				!(
+					v !== null &&
+					typeof v === "object" &&
+					!Array.isArray(v) &&
+					Object.keys(v).length === 0
+				),
+		),
+	);
 }
 
 // VS Code's own PATH is long and the same for every server; "$PATH" leaves only what this server adds.
-function withInheritedPath(env: Record<string, string>): Record<string, string> {
-    const inherited = process.env.PATH;
-    if (!env.PATH || !inherited || !env.PATH.includes(inherited)) return env;
-    return { ...env, PATH: env.PATH.replace(inherited, "$PATH") };
+function withInheritedPath(
+	env: Record<string, string>,
+): Record<string, string> {
+	const inherited = process.env.PATH;
+	if (!env.PATH || !inherited || !env.PATH.includes(inherited)) return env;
+	return { ...env, PATH: env.PATH.replace(inherited, "$PATH") };
 }
 
 function clientState(rc: clients.RunningClient): ClientInfo["state"] {
-    return rc.client.state === State.Running ? "running" : rc.client.state === State.Starting ? "starting" : "stopped";
+	return rc.client.state === State.Running
+		? "running"
+		: rc.client.state === State.Starting
+			? "starting"
+			: "stopped";
 }
 
-function entry(kind: Kind, name: string, scope: Entry["scope"], raw: Raw): Entry {
-    const binary = resolveBinary(raw);
-    const live = kind === "server" ? clients.runningClients().filter((rc) => rc.server.name === name) : [];
-    const infos: ClientInfo[] = live.map((rc) => ({
-        state: rc.client.state === State.Running ? "running" : rc.client.state === State.Starting ? "starting" : "stopped",
-        pid: rc.pid,
-        folders: [...rc.folders],
-        files: rc.docs.size,
-        venv: rc.venv && tildify(rc.venv),
-    }));
-    return { name, scope, raw, binary, clients: infos, status: status(raw, binary, infos) };
+function entry(
+	kind: Kind,
+	name: string,
+	scope: Entry["scope"],
+	raw: Raw,
+): Entry {
+	const binary = resolveBinary(raw);
+	const live =
+		kind === "server"
+			? clients.runningClients().filter((rc) => rc.server.name === name)
+			: [];
+	const infos: ClientInfo[] = live.map((rc) => ({
+		state:
+			rc.client.state === State.Running
+				? "running"
+				: rc.client.state === State.Starting
+					? "starting"
+					: "stopped",
+		pid: rc.pid,
+		folders: [...rc.folders],
+		files: rc.docs.size,
+		venv: rc.venv && tildify(rc.venv),
+	}));
+	return {
+		name,
+		scope,
+		raw,
+		binary,
+		clients: infos,
+		status: status(raw, binary, infos),
+	};
 }
 
-function status(raw: Raw, binary: Entry["binary"], infos: ClientInfo[]): Status {
-    if (raw.enabled === false) return "disabled";
-    if (infos.some((c) => c.state === "running")) return "running";
-    if (infos.some((c) => c.state === "starting")) return "starting";
-    if (infos.length > 0) return "stopped";
-    return binary === null ? "missing" : "idle";
+function status(
+	raw: Raw,
+	binary: Entry["binary"],
+	infos: ClientInfo[],
+): Status {
+	if (raw.enabled === false) return "disabled";
+	if (infos.some((c) => c.state === "running")) return "running";
+	if (infos.some((c) => c.state === "starting")) return "starting";
+	if (infos.length > 0) return "stopped";
+	return binary === null ? "missing" : "idle";
 }
 
 function resolveBinary(raw: Raw): Entry["binary"] {
-    const command = Array.isArray(raw.command) ? (raw.command as unknown[]) : [];
-    if (typeof command[0] !== "string" || command[0] === "") return null;
-    // Root-dependent commands can only be resolved once a file picks a root.
-    if (command[0].includes("${root") || isProjectRelative(command[0])) return undefined;
-    const env = isPlainEnv(raw.env) ? withExtraPaths(raw.env) : withExtraPaths(undefined);
-    return findExecutable(expandHome(command[0]), env.PATH);
+	const command = Array.isArray(raw.command) ? (raw.command as unknown[]) : [];
+	if (typeof command[0] !== "string" || command[0] === "") return null;
+	// Root-dependent commands can only be resolved once a file picks a root.
+	if (command[0].includes("${root") || isProjectRelative(command[0]))
+		return undefined;
+	const env = isPlainEnv(raw.env)
+		? withExtraPaths(raw.env)
+		: withExtraPaths(undefined);
+	return findExecutable(expandHome(command[0]), env.PATH);
 }
 
 function isPlainEnv(v: unknown): v is Record<string, string> {
-    return isPlainObject(v) && Object.values(v).every((x) => typeof x === "string");
+	return (
+		isPlainObject(v) && Object.values(v).every((x) => typeof x === "string")
+	);
 }
 
 function html(webview: vscode.Webview, root: vscode.Uri): string {
-    const nonce = randomBytes(16).toString("base64");
-    const asset = (file: string) => webview.asWebviewUri(vscode.Uri.joinPath(root, file));
-    return `<!doctype html>
+	const nonce = randomBytes(16).toString("base64");
+	const asset = (file: string) =>
+		webview.asWebviewUri(vscode.Uri.joinPath(root, file));
+	return `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
