@@ -1,6 +1,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
+import { errorText } from "./notify";
 
 export type RootMarker = string | string[];
 
@@ -38,65 +39,145 @@ export interface FormatterConfig {
     stdin: boolean;
     exitCodes: number[];
     env: Record<string, string>;
+    timeoutMs: number;
 }
-
-type RawServer = Partial<Omit<ServerConfig, "name" | "order" | "venv">> & { enabled?: boolean; venv?: boolean | string[] };
 
 const defaultVenvNames = [".venv", "venv", "env"];
+const formatModes: FormatMode[] = ["fallback", "prefer", "never"];
 
-function venvNames(venv: boolean | string[] | undefined): string[] | undefined {
-    if (venv === true) return defaultVenvNames;
-    return Array.isArray(venv) && venv.length > 0 ? venv : undefined;
-}
-type RawFormatter = Partial<Omit<FormatterConfig, "name">> & { enabled?: boolean };
-
-export function readServers(): Map<string, ServerConfig> {
-    const servers = new Map<string, ServerConfig>();
-    for (const [name, s] of enabledEntries<RawServer>("servers")) {
-        servers.set(name, {
+// Problems are collected rather than thrown, so one bad entry can't stop every other server.
+export function readServers(problems: string[] = []): Map<string, ServerConfig> {
+    const servers = parseEntries("servers", problems, (name, field, s, order): ServerConfig => {
+        const fallbackRoot = field.string("fallbackRoot");
+        return {
             name,
-            command: s.command!.map(expandHome),
-            languages: s.languages ?? [],
-            filePatterns: normalizePatterns(s.filePatterns),
-            rootMarkers: s.rootMarkers ?? [],
-            singleFileSupport: s.singleFileSupport ?? true,
-            fallbackRoot: s.fallbackRoot ? expandHome(s.fallbackRoot) : undefined,
-            settings: expandDottedKeys(s.settings ?? {}) as Record<string, unknown>,
+            command: field.command(),
+            languages: field.strings("languages"),
+            filePatterns: normalizePatterns(field.strings("filePatterns")),
+            rootMarkers: field.markers(),
+            singleFileSupport: field.boolean("singleFileSupport") ?? true,
+            fallbackRoot: fallbackRoot && expandHome(fallbackRoot),
+            settings: expandDottedKeys(field.object("settings") ?? {}),
             initializationOptions: s.initializationOptions,
-            env: withExtraPaths(s.env),
-            disabledCapabilities: s.disabledCapabilities ?? [],
-            format: s.format ?? "fallback",
-            multiRoot: s.multiRoot ?? true,
-            venv: venvNames(s.venv),
-            order: servers.size,
-        });
-    }
-    return servers;
+            env: withExtraPaths(field.env()),
+            disabledCapabilities: field.strings("disabledCapabilities"),
+            format: field.oneOf("format", formatModes) ?? "fallback",
+            multiRoot: field.boolean("multiRoot") ?? true,
+            venv: field.venv(),
+            order,
+        };
+    });
+    return new Map(servers.map((s) => [s.name, s]));
 }
 
 // Settings order is the chain order when several formatters match one file.
-export function readFormatters(): FormatterConfig[] {
-    return enabledEntries<RawFormatter>("formatters").map(([name, f]) => ({
+export function readFormatters(problems: string[] = []): FormatterConfig[] {
+    return parseEntries("formatters", problems, (name, field) => ({
         name,
-        command: f.command!.map(expandHome),
-        languages: f.languages ?? [],
-        filePatterns: normalizePatterns(f.filePatterns),
-        rootMarkers: f.rootMarkers ?? [],
-        requireRoot: f.requireRoot ?? false,
-        stdin: f.stdin ?? true,
-        exitCodes: f.exitCodes ?? [0],
-        env: withExtraPaths(f.env),
+        command: field.command(),
+        languages: field.strings("languages"),
+        filePatterns: normalizePatterns(field.strings("filePatterns")),
+        rootMarkers: field.markers(),
+        requireRoot: field.boolean("requireRoot") ?? false,
+        stdin: field.boolean("stdin") ?? true,
+        exitCodes: field.numbers("exitCodes") ?? [0],
+        env: withExtraPaths(field.env()),
+        timeoutMs: field.number("timeout") ?? 10_000,
     }));
 }
 
-function enabledEntries<T extends { enabled?: boolean; command?: string[] }>(key: string): [string, T][] {
-    const raw = vscode.workspace.getConfiguration("generalLsp").get<Record<string, T>>(key, {});
-    return Object.entries(raw).filter(([, v]) => v.enabled !== false && Array.isArray(v.command) && v.command.length > 0);
+// Builds each enabled entry; one with a malformed field is skipped and reported.
+function parseEntries<T>(
+    key: string,
+    problems: string[],
+    build: (name: string, field: ReturnType<typeof fields>, raw: Record<string, unknown>, index: number) => T,
+): T[] {
+    const raw = vscode.workspace.getConfiguration("generalLsp").get<Record<string, unknown>>(key, {});
+    const built: T[] = [];
+    for (const [name, value] of Object.entries(raw)) {
+        if (!isPlainObject(value)) {
+            problems.push(`${key}.${name}: expected an object, skipped`);
+            continue;
+        }
+        if (value.enabled === false) continue;
+        try {
+            built.push(build(name, fields(name, value), value, built.length));
+        } catch (err) {
+            problems.push(`${key}.${name}: ${errorText(err)}, skipped`);
+        }
+    }
+    return built;
 }
 
-// A bare "*.zig" would only match against the full path, so anchor it anywhere.
+function fields(where: string, raw: Record<string, unknown>) {
+    const fail = (key: string, expected: string): never => {
+        throw new Error(`'${key}' must be ${expected} (in ${where})`);
+    };
+    const strings = (key: string): string[] => {
+        const v = raw[key];
+        if (v === undefined) return [];
+        if (!Array.isArray(v) || !v.every((x) => typeof x === "string")) return fail(key, "a list of strings");
+        return v;
+    };
+    return {
+        strings,
+        command: () => {
+            const command = strings("command");
+            if (command.length === 0 || command[0] === "") return fail("command", "a non-empty list of strings");
+            return command.map(expandHome);
+        },
+        markers: (): RootMarker[] => {
+            const v = raw.rootMarkers;
+            if (v === undefined) return [];
+            const ok =
+                Array.isArray(v) &&
+                v.every((m) => typeof m === "string" || (Array.isArray(m) && m.every((x) => typeof x === "string")));
+            return ok ? (v as RootMarker[]) : fail("rootMarkers", "a list of names or lists of names");
+        },
+        boolean: (key: string): boolean | undefined => {
+            const v = raw[key];
+            return v === undefined || typeof v === "boolean" ? v : fail(key, "true or false");
+        },
+        string: (key: string): string | undefined => {
+            const v = raw[key];
+            return v === undefined || typeof v === "string" ? v : fail(key, "a string");
+        },
+        number: (key: string): number | undefined => {
+            const v = raw[key];
+            return v === undefined || (typeof v === "number" && v > 0) ? v : fail(key, "a positive number");
+        },
+        numbers: (key: string): number[] | undefined => {
+            const v = raw[key];
+            if (v === undefined) return undefined;
+            return Array.isArray(v) && v.every(Number.isInteger) ? v : fail(key, "a list of integers");
+        },
+        object: (key: string): Record<string, unknown> | undefined => {
+            const v = raw[key];
+            return v === undefined || isPlainObject(v) ? v : fail(key, "an object");
+        },
+        env: (): Record<string, string> | undefined => {
+            const v = raw.env;
+            if (v === undefined) return undefined;
+            const ok = isPlainObject(v) && Object.values(v).every((x) => typeof x === "string");
+            return ok ? (v as Record<string, string>) : fail("env", "an object of strings");
+        },
+        oneOf: <T extends string>(key: string, options: T[]): T | undefined => {
+            const v = raw[key];
+            return v === undefined || options.includes(v as T) ? (v as T | undefined) : fail(key, options.join(", "));
+        },
+        venv: (): string[] | undefined => {
+            const v = raw.venv;
+            if (v === undefined || v === false) return undefined;
+            if (v === true) return defaultVenvNames;
+            const names = strings("venv");
+            return names.length > 0 ? names : undefined;
+        },
+    };
+}
+
+// Globs match against absolute paths, so anything not already anchored can sit at any depth: "*.zig", "src/*.x".
 export function normalizePatterns(patterns: string[] | undefined): string[] {
-    return (patterns ?? []).map((p) => (p.includes("/") ? p : `**/${p}`));
+    return (patterns ?? []).map((p) => (p.startsWith("/") || p.startsWith("**/") || /^[A-Za-z]:/.test(p) ? p : `**/${p}`));
 }
 
 // generalLsp.extraPaths is searched after PATH, like Mason's PATH = "append".
@@ -144,14 +225,22 @@ export function expandHome(arg: string): string {
 }
 
 // VS Code-style flat keys ("rust-analyzer.check.command") become nested objects, so both styles work.
-function expandDottedKeys(value: unknown): unknown {
-    if (!isPlainObject(value)) return value;
+// Only top-level keys are section paths; deeper keys like yaml.schemas URLs or globs keep their dots.
+function expandDottedKeys(value: Record<string, unknown>): Record<string, unknown> {
     const out: Record<string, unknown> = {};
     for (const [key, v] of Object.entries(value)) {
-        const nested = key.split(".").reduceRight<unknown>((acc, part) => ({ [part]: acc }), expandDottedKeys(v));
+        // A copy, because merging writes into it and VS Code's configuration values are read-only proxies.
+        const nested = key.split(".").reduceRight<unknown>((acc, part) => ({ [part]: acc }), plainCopy(v));
         deepMerge(out, nested as Record<string, unknown>);
     }
     return out;
+}
+
+// structuredClone and JSON.stringify both choke on VS Code's configuration proxies; enumerating them works.
+function plainCopy(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(plainCopy);
+    if (isPlainObject(value)) return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, plainCopy(v)]));
+    return value;
 }
 
 function deepMerge(target: Record<string, unknown>, src: Record<string, unknown>): Record<string, unknown> {
@@ -162,6 +251,6 @@ function deepMerge(target: Record<string, unknown>, src: Record<string, unknown>
     return target;
 }
 
-function isPlainObject(v: unknown): v is Record<string, unknown> {
+export function isPlainObject(v: unknown): v is Record<string, unknown> {
     return v !== null && typeof v === "object" && !Array.isArray(v);
 }

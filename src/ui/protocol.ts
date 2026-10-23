@@ -68,9 +68,21 @@ export interface ProcessInfo {
 }
 
 export interface LogLine {
+    seq: number;
     time: number;
     level: "trace" | "debug" | "info" | "warn" | "error" | "output";
     text: string;
+}
+
+export interface NoticeInfo {
+    seq: number;
+    time: number;
+    level: "error" | "warning";
+    // What it's about: a server or formatter name, "settings", or "general-lsp" for the extension itself.
+    source: string;
+    message: string;
+    // How often the same problem happened in a row.
+    count: number;
 }
 
 export interface UiState {
@@ -78,6 +90,9 @@ export interface UiState {
     formatters: Entry[];
     buffers: BufferInfo[];
     processes: ProcessInfo[];
+    notices: NoticeInfo[];
+    unseenNotices: number;
+    unseenSeverity?: NoticeInfo["level"];
     extraPaths: { path: string; exists: boolean }[];
     hasWorkspace: boolean;
 }
@@ -98,11 +113,19 @@ export type UiMessage =
     | { type: "clearLog"; server: string }
     | { type: "stopProcess"; id: number }
     | { type: "restartProcess"; id: number }
-    | { type: "saveExtraPaths"; paths: string[] };
+    | { type: "saveExtraPaths"; paths: string[] }
+    | { type: "checkPaths"; paths: string[] }
+    | { type: "seenNotices" }
+    | { type: "clearNotices" }
+    | { type: "showLog" };
 
 export type HostMessage =
     | { type: "state"; state: UiState }
     | { type: "saved"; kind: Kind; name: string }
     // `reset` replaces the shown log (a new server was picked); otherwise the lines are appended.
     | { type: "log"; server: string; lines: LogLine[]; reset: boolean }
+    | { type: "pathsChecked"; exists: Record<string, boolean> }
+    // Opened from a notification or the status bar: jump straight to that tab.
+    | { type: "showTab"; tab: string }
+    | { type: "noticesSeen" }
     | { type: "error"; message: string };

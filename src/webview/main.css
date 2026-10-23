@@ -180,7 +180,9 @@ code,
 .tab:focus-visible,
 .switch:focus-visible,
 .segmented button:focus-visible,
-.entry:focus-visible {
+.entry-main:focus-visible,
+.chip:focus-visible,
+.link:focus-visible {
     outline: 1px solid var(--vscode-focusBorder);
     outline-offset: -1px;
 }
@@ -251,15 +253,29 @@ code,
     flex: 1;
 }
 
+/* A row is a select button plus sibling controls, so screen readers don't see buttons nested in buttons. */
 .entry {
+    display: flex;
+    align-items: center;
+    padding-right: 10px;
+    border-left: 2px solid transparent;
+}
+
+.entry-main {
+    flex: 1;
+    min-width: 0;
     display: grid;
-    grid-template-columns: 10px 1fr auto;
-    grid-template-areas: "dot name actions" ". sub actions";
+    grid-template-columns: 10px 1fr;
+    grid-template-areas: "dot name" ". sub";
     column-gap: 10px;
     align-items: center;
-    padding: 6px 10px 6px 14px;
+    padding: 6px 6px 6px 14px;
+    background: none;
+    border: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
     cursor: pointer;
-    border-left: 2px solid transparent;
 }
 
 .entry .dot {
@@ -284,7 +300,6 @@ code,
 }
 
 .entry .row-actions {
-    grid-area: actions;
     display: flex;
     align-items: center;
     gap: 2px;
@@ -658,7 +673,8 @@ textarea {
     tab-size: 2;
 }
 
-textarea.invalid {
+textarea.invalid,
+input.invalid {
     border-color: var(--vscode-inputValidation-errorBorder, var(--bad));
 }
 
@@ -855,6 +871,85 @@ textarea.invalid {
 
 .paths .hint {
     margin: 0;
+}
+
+/* ---------- problems ---------- */
+
+.tab .count.error {
+    background: var(--vscode-errorForeground, var(--bad));
+    color: var(--vscode-editor-background);
+}
+
+.tab .count.warning {
+    background: var(--warn);
+    color: var(--vscode-editor-background);
+}
+
+.problems-page {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+.problems-page .buffers-bar {
+    padding: 8px 20px;
+    justify-content: space-between;
+}
+
+.problems-page .actions {
+    display: flex;
+    gap: 4px;
+}
+
+.notice-list {
+    list-style: none;
+    margin: 0;
+    padding: 8px 20px 24px;
+    overflow-y: auto;
+}
+
+.notice {
+    display: grid;
+    grid-template-columns: 18px auto 1fr auto auto;
+    align-items: start;
+    gap: 10px;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--border);
+    border-left: 2px solid transparent;
+    max-width: 1100px;
+}
+
+.notice.unseen {
+    border-left-color: var(--vscode-focusBorder);
+    background: var(--vscode-list-inactiveSelectionBackground);
+}
+
+.notice > .codicon {
+    margin-top: 2px;
+}
+
+.level-error {
+    color: var(--bad);
+}
+
+.level-warning {
+    color: var(--warn);
+}
+
+.notice-text {
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.notice-time {
+    font-family: var(--mono);
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.chip.static {
+    cursor: default;
 }
 
 /* ---------- processes ---------- */

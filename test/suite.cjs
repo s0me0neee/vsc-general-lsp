@@ -260,7 +260,7 @@ const tests = {
     assert.equal(state.formatters.find((f) => f.name === "not-installed").status, "missing");
     assert.deepEqual(
       state.formatters.map((f) => f.name),
-      ["upper", "not-installed", "suffix", "in-place", "broken"],
+      ["upper", "not-installed", "suffix", "in-place", "broken", "relative", "slowfmt"],
     );
     panel.dispose();
   },
@@ -278,6 +278,9 @@ const tests = {
     const probe = processes().find((p) => p.server === "venv-probe");
     assert.ok(probe.config.venv.endsWith("venv"));
     assert.equal(probe.config.env.VIRTUAL_ENV, probe.config.venv);
+    // VS Code's own PATH is folded into "$PATH", leaving just the venv bin and extra paths visible.
+    assert.ok(probe.config.env.PATH.startsWith(path.join(probe.config.venv, "bin")));
+    assert.ok(probe.config.env.PATH.includes("$PATH"));
 
     // stderr is captured line by line, before it reaches the Output panel.
     const marker = api.logs.lines("gopls").find((l) => l.text === "glsp-stderr-marker");
@@ -344,11 +347,11 @@ const tests = {
     assert.deepEqual(names().slice(-1), ["lower"]);
 
     await store.saveEntry("formatter", "workspace", "suffix-renamed", { command: ["sed", "s/$/;/"], filePatterns: ["*.up"] }, "suffix");
-    assert.deepEqual(names(), ["upper", "not-installed", "suffix-renamed", "in-place", "broken", "lower"]);
+    assert.deepEqual(names(), ["upper", "not-installed", "suffix-renamed", "in-place", "broken", "relative", "slowfmt", "lower"]);
     await assert.rejects(store.saveEntry("formatter", "workspace", "upper", { command: ["x"] }, "lower"), /already exists/);
 
     await store.moveEntry("formatter", "lower", -1);
-    assert.deepEqual(names().slice(-2), ["lower", "broken"]);
+    assert.deepEqual(names().slice(-2), ["lower", "slowfmt"]);
     const raw = vscode.workspace.getConfiguration("generalLsp").inspect("formatters").workspaceValue;
     assert.ok(Object.values(raw).every((f) => !("__reordering" in f)), "transient marker removed");
 
@@ -366,6 +369,152 @@ const tests = {
     await waitFor(async () => (await formatted("fmt/b.up")) === "plain;\n", "upper to be skipped");
     await store.setEnabled("formatter", "upper", true);
     assert.equal("enabled" in vscode.workspace.getConfiguration("generalLsp").inspect("formatters").workspaceValue.upper, false);
+  },
+
+  async "settings: dotted keys only split at the top, relative patterns anchored"(api) {
+    const { store } = api;
+    await store.saveEntry("server", "workspace", "parse-check", {
+      command: ["glsp-no-such-server"],
+      filePatterns: ["src/*.x", "*.y", "/abs/*.z", "**/k"],
+      settings: { "yaml.schemas": { "https://json.schemastore.org/a.json": "*.yml" }, "a.b": 1, a: { c: 2 } },
+    });
+    const parsed = api.readServers().get("parse-check");
+    assert.deepEqual(parsed.settings, {
+      yaml: { schemas: { "https://json.schemastore.org/a.json": "*.yml" } },
+      a: { b: 1, c: 2 },
+    });
+    assert.deepEqual(parsed.filePatterns, ["**/src/*.x", "**/*.y", "/abs/*.z", "**/k"]);
+    await store.deleteEntry("server", "parse-check");
+  },
+
+  async "settings: one malformed entry is skipped and reported, the rest keep working"(api) {
+    const { store } = api;
+    await store.saveEntry("server", "workspace", "malformed", { command: ["gopls"], languages: "go" });
+    await waitFor(
+      () =>
+        api
+          .notices()
+          .some((n) => n.source === "settings" && n.message.includes("servers.malformed") && n.message.includes("'languages'")),
+      "problem reported",
+    );
+    assert.equal(api.readServers().has("malformed"), false);
+    assert.ok(runningClient(api, "gopls"));
+    await store.deleteEntry("server", "malformed");
+  },
+
+  async "commands: a foreign owner is respected, dynamic ones go to the file's own client"(api) {
+    // Another extension (think the Ruff extension) already owns fake.static before any fake server starts.
+    const foreign = vscode.commands.registerCommand("fake.static", () => "foreign");
+    try {
+      const a = await open("fake1/a.fake");
+      const b = await open("fake2/b.fake");
+      await waitFor(() => {
+        const started = api.runningClients().filter((rc) => rc.server.name === "fake" && rc.started);
+        return started.length === 2;
+      }, "both fake servers started despite the clash");
+      assert.equal(await vscode.commands.executeCommand("fake.static"), "foreign");
+      // Each server registered fake.dynamic at runtime; the call reaches the server of the active file.
+      for (const doc of [a, b]) {
+        await vscode.window.showTextDocument(doc);
+        const owner = owners(api, doc, "fake")[0];
+        const result = await waitFor(
+          () => vscode.commands.executeCommand("fake.dynamic").then(undefined, () => undefined),
+          "fake.dynamic registered",
+        );
+        assert.equal(result, `fake.dynamic:${owner.pid}`);
+      }
+    } finally {
+      foreign.dispose();
+    }
+  },
+
+  async "logs: a stderr line without a trailing newline still shows up"(api) {
+    await waitFor(() => api.logs.lines("fake").some((l) => l.text === "glsp-partial-line"), "partial line flushed");
+  },
+
+  async "closing a file releases it even while its server is still starting"(api) {
+    const doc = await open("slow/a.ini");
+    const uri = doc.uri.toString();
+    const rc = await waitFor(
+      () => api.runningClients().find((c) => c.server.name === "fake-slow" && c.docs.has(uri)),
+      "slow server owns a.ini",
+    );
+    assert.equal(rc.client.isRunning(), false, "still starting");
+    // Changing the language closes and reopens the document; the slow server no longer matches it.
+    await vscode.languages.setTextDocumentLanguage(doc, "plaintext");
+    await waitFor(() => !rc.docs.has(uri), "a.ini released");
+    assert.equal(rc.client.isRunning(), false, "released before languageclient could have reported the close");
+  },
+
+  async "a settings change while a new root waits for its host applies the new settings"(api) {
+    await open("race1/a.conf");
+    await waitFor(() => api.runningClients().some((rc) => rc.server.name === "fake-race"), "race host spawned");
+    // Joins the host as a workspace folder, but first waits for the host to finish its slow start.
+    await open("race2/b.conf");
+    const config = vscode.workspace.getConfiguration("generalLsp");
+    const servers = config.inspect("servers").workspaceValue;
+    await config.update(
+      "servers",
+      { ...servers, "fake-race": { ...servers["fake-race"], settings: { v: 2 } } },
+      vscode.ConfigurationTarget.Workspace,
+    );
+    const serving = await waitFor(
+      () => {
+        const started = api.runningClients().filter((rc) => rc.server.name === "fake-race" && rc.started);
+        return started.flatMap((rc) => [...rc.docs]).length === 2 ? started : undefined;
+      },
+      "both roots served",
+      15000,
+    );
+    for (const rc of serving) assert.deepEqual(rc.server.settings, { v: 2 });
+  },
+
+  async "formatters: relative commands run from the root; timeouts say so"(api) {
+    assert.equal(await formatted("fake1/x.relfmt"), "HELLO\n");
+    assert.equal(await formatted("fmt/c.slowfmt"), "unchanged\n");
+    await waitFor(
+      () => api.logs.lines("formatters").some((l) => l.text.includes("slowfmt") && l.text.includes("timed out after 300ms")),
+      "timeout logged",
+    );
+  },
+
+  async "idleTimeout stops a server after its last file closes"(api) {
+    const config = vscode.workspace.getConfiguration("generalLsp");
+    await config.update("idleTimeout", 1, vscode.ConfigurationTarget.Workspace);
+    try {
+      const doc = await open("idle/a.bat");
+      await waitFor(() => runningClient(api, "fake-idle"), "fake-idle running");
+      await vscode.languages.setTextDocumentLanguage(doc, "plaintext");
+      await waitFor(() => !api.runningClients().some((rc) => rc.server.name === "fake-idle"), "fake-idle stopped", 5000);
+    } finally {
+      await config.update("idleTimeout", undefined, vscode.ConfigurationTarget.Workspace);
+    }
+  },
+
+  async "problems: missing binaries, failing formatters and crash loops are reported"(api) {
+    const has = (level, source, text) =>
+      api.notices().some((n) => n.level === level && n.source === source && n.message.includes(text));
+
+    // From the earlier "a failing formatter leaves the file alone" test.
+    assert.ok(has("warning", "formatter broken", "exited with 2"));
+    // Optional tools are listed without a pop-up.
+    assert.ok(has("warning", "formatter not-installed", "not installed"));
+
+    await api.store.saveEntry("server", "workspace", "missing-bin", {
+      command: ["glsp-no-such-server"],
+      filePatterns: ["*.missing"],
+    });
+    await open("fmt/x.missing");
+    await waitFor(() => has("error", "missing-bin", "was not found"), "missing binary reported");
+    await api.store.deleteEntry("server", "missing-bin");
+
+    // Crashes 300ms after every start: languageclient restarts it 4 times, then gives up.
+    await open("crash/a.crash");
+    await waitFor(() => has("warning", "fake-crash", "crashed and was restarted"), "crash reported", 20000);
+    await waitFor(() => has("error", "fake-crash", "stopped unexpectedly"), "giving up reported", 30000);
+    const crash = api.notices().find((n) => n.source === "fake-crash" && n.message.includes("crashed"));
+    assert.ok(crash.message.includes("×"));
+    await api.dispatch({ type: "stop", name: "fake-crash" });
   },
 
   async "config changes stop removed servers and keep unchanged ones"(api) {
@@ -388,7 +537,11 @@ exports.run = async function run() {
   const api = await vscode.extensions.getExtension("maot27.general-lsp").activate();
   if (process.env.MODE === "kill") return killHost(api);
   const failures = [];
+  // ONLY=<regex> runs a subset; tests still run in order, so pick ones that don't depend on earlier state.
+  const only = process.env.ONLY && new RegExp(process.env.ONLY);
   for (const [name, test] of Object.entries(tests)) {
+    if (only && !only.test(name)) continue;
+    if (process.env.DEBUG_TESTS) console.log(`  … ${new Date().toISOString().slice(11, 23)} ${name}`);
     try {
       await test(api);
       console.log(`  ✓ ${name}`);

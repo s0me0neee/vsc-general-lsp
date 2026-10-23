@@ -16,7 +16,8 @@ import type {
     UiState,
 } from "../ui/protocol";
 
-type Tab = "buffers" | "processes" | "servers" | "formatters" | "paths";
+const allTabs = ["buffers", "processes", "problems", "servers", "formatters", "paths"] as const;
+type Tab = (typeof allTabs)[number];
 interface Persisted {
     tab: Tab;
     selected: Partial<Record<Kind | "process", string>>;
@@ -54,6 +55,7 @@ function App() {
     const [toast, setToast] = useState<{ error: boolean; text: string }>();
     const [errors, setErrors] = useState(0);
     const [log, setLog] = useState<ShownLog>();
+    const [checkedPaths, setCheckedPaths] = useState<Record<string, boolean>>({});
     const saved = useRef<(kind: Kind, name: string) => void>();
 
     useEffect(() => {
@@ -66,6 +68,13 @@ function App() {
                         ? { server: message.server, lines: message.lines }
                         : { server: message.server, lines: [...shown.lines, ...message.lines].slice(-5000) },
                 );
+            }
+            else if (message.type === "noticesSeen")
+                setState((s) => s && { ...s, unseenNotices: 0, unseenSeverity: undefined });
+            else if (message.type === "pathsChecked") setCheckedPaths((known) => ({ ...known, ...message.exists }));
+            else if (message.type === "showTab" && allTabs.includes(message.tab as Tab)) {
+                setTab(message.tab as Tab);
+                persist({ tab: message.tab as Tab });
             }
             else if (message.type === "error") {
                 setToast({ error: true, text: message.message });
@@ -99,6 +108,15 @@ function App() {
 
     if (!state) return <div class="loading">Loading…</div>;
     const running = state.servers.filter((s) => s.status === "running").length;
+    const alert = state.unseenSeverity;
+    const tabs: [Tab, string, number][] = [
+        ["buffers", "Buffers", state.buffers.filter((b) => !b.hidden).length],
+        ["processes", "Processes", state.processes.length],
+        ["problems", "Problems", state.notices.length],
+        ["servers", "Servers", state.servers.length],
+        ["formatters", "Formatters", state.formatters.length],
+        ["paths", "Paths", state.extraPaths.length],
+    ];
 
     return (
         <div class="app">
@@ -110,34 +128,37 @@ function App() {
                         {running} of {state.servers.length} servers running
                     </span>
                 </div>
-                <nav class="tabs" role="tablist">
-                    <TabButton
-                        active={tab === "buffers"}
-                        onClick={() => choose("buffers")}
-                        count={state.buffers.filter((b) => !b.hidden).length}
-                    >
-                        Buffers
-                    </TabButton>
-                    <TabButton
-                        active={tab === "processes"}
-                        onClick={() => choose("processes")}
-                        count={state.processes.length}
-                    >
-                        Processes
-                    </TabButton>
-                    <TabButton active={tab === "servers"} onClick={() => choose("servers")} count={state.servers.length}>
-                        Servers
-                    </TabButton>
-                    <TabButton
-                        active={tab === "formatters"}
-                        onClick={() => choose("formatters")}
-                        count={state.formatters.length}
-                    >
-                        Formatters
-                    </TabButton>
-                    <TabButton active={tab === "paths"} onClick={() => choose("paths")} count={state.extraPaths.length}>
-                        Paths
-                    </TabButton>
+                <nav
+                    class="tabs"
+                    role="tablist"
+                    aria-label="General LSP sections"
+                    onKeyDown={(e) => {
+                        // Arrow keys move between tabs; only the active one sits in the Tab order.
+                        const ids = tabs.map(([id]) => id);
+                        const at = ids.indexOf(tab);
+                        const next =
+                            e.key === "ArrowRight" ? ids[(at + 1) % ids.length]
+                            : e.key === "ArrowLeft" ? ids[(at - 1 + ids.length) % ids.length]
+                            : e.key === "Home" ? ids[0]
+                            : e.key === "End" ? ids[ids.length - 1]
+                            : undefined;
+                        if (!next) return;
+                        e.preventDefault();
+                        choose(next);
+                        requestAnimationFrame(() => document.getElementById(`tab-${next}`)?.focus());
+                    }}
+                >
+                    {tabs.map(([id, label, count]) => (
+                        <TabButton
+                            id={`tab-${id}`}
+                            active={tab === id}
+                            onClick={() => choose(id)}
+                            count={count}
+                            alert={id === "problems" ? alert : undefined}
+                        >
+                            {label}
+                        </TabButton>
+                    ))}
                 </nav>
                 <div class="actions">
                     <button class="btn secondary" onClick={() => send({ type: "openJson" })} title="Open settings.json">
@@ -156,8 +177,10 @@ function App() {
                 <BuffersView buffers={state.buffers} formatters={state.formatters} goto={goto} />
             ) : tab === "processes" ? (
                 <ProcessesView state={state} log={log} goto={goto} />
+            ) : tab === "problems" ? (
+                <ProblemsView state={state} goto={goto} />
             ) : tab === "paths" ? (
-                <PathsView paths={state.extraPaths} />
+                <PathsView paths={state.extraPaths} checked={checkedPaths} />
             ) : (
                 <MasterDetail
                     key={tab}
@@ -177,11 +200,25 @@ function App() {
     );
 }
 
-function TabButton(props: { active: boolean; onClick: () => void; count: number; children: ComponentChildren }) {
+function TabButton(props: {
+    id: string;
+    active: boolean;
+    onClick: () => void;
+    count: number;
+    alert?: "error" | "warning";
+    children: ComponentChildren;
+}) {
     return (
-        <button role="tab" aria-selected={props.active} class={`tab ${props.active ? "active" : ""}`} onClick={props.onClick}>
+        <button
+            id={props.id}
+            role="tab"
+            aria-selected={props.active}
+            tabIndex={props.active ? 0 : -1}
+            class={`tab ${props.active ? "active" : ""}`}
+            onClick={props.onClick}
+        >
             {props.children}
-            <span class="count">{props.count}</span>
+            <span class={`count ${props.alert ?? ""}`}>{props.count}</span>
         </button>
     );
 }
@@ -232,7 +269,7 @@ function MasterDetail(props: {
                         onInput={(e) => setFilter(e.currentTarget.value)}
                     />
                 </label>
-                <ul class="entries" role="listbox">
+                <ul class="entries" aria-label={`${kind}s`}>
                     {visible.map((e) => (
                         <ListItem
                             key={e.name}
@@ -246,8 +283,10 @@ function MasterDetail(props: {
                     ))}
                     {draft && (
                         <li class="entry active new">
-                            <span class="dot idle" />
-                            <span class="name">New {kind}</span>
+                            <span class="entry-main" aria-current="true">
+                                <span class="dot idle" />
+                                <span class="name">New {kind}</span>
+                            </span>
                         </li>
                     )}
                 </ul>
@@ -306,23 +345,19 @@ function ListItem(props: {
     const { entry, kind } = props;
     const enabled = entry.raw.enabled !== false;
     const targets = [...asStrings(entry.raw.languages), ...asStrings(entry.raw.filePatterns)];
-    const stop = (e: Event) => e.stopPropagation();
     return (
-        <li
-            class={`entry ${props.active ? "active" : ""} ${enabled ? "" : "disabled"}`}
-            role="option"
-            aria-selected={props.active}
-            tabIndex={0}
-            onClick={props.onSelect}
-            onKeyDown={(e) => e.key === "Enter" && props.onSelect()}
-        >
-            <span class={`dot ${entry.status}`} title={statusLabel(kind, entry.status)} />
-            <span class="name">
-                {kind === "formatter" && <span class="order">{props.index + 1}</span>}
-                {entry.name}
-            </span>
-            <span class="sub">{targets.slice(0, 3).join(", ") + (targets.length > 3 ? ` +${targets.length - 3}` : "")}</span>
-            <span class="row-actions" onClick={stop}>
+        <li class={`entry ${props.active ? "active" : ""} ${enabled ? "" : "disabled"}`}>
+            <button class="entry-main" aria-current={props.active ? "true" : undefined} onClick={props.onSelect}>
+                <span class={`dot ${entry.status}`} title={statusLabel(kind, entry.status)} />
+                <span class="name">
+                    {kind === "formatter" && <span class="order">{props.index + 1}</span>}
+                    {entry.name}
+                </span>
+                <span class="sub">
+                    {targets.slice(0, 3).join(", ") + (targets.length > 3 ? ` +${targets.length - 3}` : "")}
+                </span>
+            </button>
+            <span class="row-actions">
                 <IconButton
                     icon="arrow-up"
                     title="Move up (earlier in chain / priority)"
@@ -380,14 +415,18 @@ function Editor(props: {
     const { kind, entry } = props;
     const [name, setName] = useState(props.name);
     const [raw, setRaw] = useState<Raw>(props.raw);
+    // The settings value the local edits were made against.
+    const [base, setBase] = useState<Raw>(props.raw);
     const [scope, setScope] = useState<Scope>(props.scope);
-    const [jsonErrors, setJsonErrors] = useState<Record<string, boolean>>({});
+    // Per-field validation messages; any present blocks saving.
+    const [fieldErrors, setFieldErrors] = useState<Record<string, string | undefined>>({});
     const [busy, setBusy] = useState(false);
 
     const dirty = props.isNew || name !== props.name || stableJson(raw) !== stableJson(props.raw);
-    // Settings changed elsewhere (settings.json, the list toggles) flow in unless there are local edits.
+    // Settings changed elsewhere (settings.json, the list switch) flow in under any unsaved edits, so saving can't undo them.
     useEffect(() => {
-        if (!dirty) setRaw(props.raw);
+        setRaw((current) => rebase(current, base, props.raw));
+        setBase(props.raw);
         setBusy(false);
     }, [stableJson(props.raw)]);
     // A rejected save (e.g. duplicate name) must hand the form back.
@@ -400,17 +439,18 @@ function Editor(props: {
             else next[key] = value;
             return next;
         });
-    const setJsonError = (key: string, bad: boolean) => setJsonErrors((e) => ({ ...e, [key]: bad }));
+    const setFieldError = (key: string, message: string | undefined) =>
+        setFieldErrors((e) => ({ ...e, [key]: message }));
 
     const command = asStrings(raw.command);
+    const neverAttaches = "Add a language or a file pattern, or it will never attach.";
     const problems = [
         !name.trim() && "Name is required.",
         command.filter(Boolean).length === 0 && "Command needs at least the executable.",
-        asStrings(raw.languages).length + asStrings(raw.filePatterns).length === 0 &&
-            "Add a language or a file pattern, or it will never attach.",
-        Object.values(jsonErrors).some(Boolean) && "Fix the invalid JSON first.",
+        asStrings(raw.languages).length + asStrings(raw.filePatterns).length === 0 && neverAttaches,
+        ...Object.values(fieldErrors),
     ].filter((p): p is string => Boolean(p));
-    const blocking = problems.filter((p) => !p.startsWith("Add a language"));
+    const blocking = problems.filter((p) => p !== neverAttaches);
 
     const save = () => {
         if (blocking.length > 0 || !dirty) return;
@@ -428,19 +468,10 @@ function Editor(props: {
         if (props.isNew) props.onCancel?.();
         setName(props.name);
         setRaw(props.raw);
-        setJsonErrors({});
+        setFieldErrors({});
     };
 
-    useEffect(() => {
-        const onKey = (e: KeyboardEvent) => {
-            if ((e.metaKey || e.ctrlKey) && e.key === "s") {
-                e.preventDefault();
-                save();
-            }
-        };
-        window.addEventListener("keydown", onKey);
-        return () => window.removeEventListener("keydown", onKey);
-    });
+    useSaveShortcut(save);
 
     return (
         <div class="editor">
@@ -626,14 +657,14 @@ function Editor(props: {
                                 hint="Answers workspace/configuration; nested or dotted keys."
                                 value={raw.settings}
                                 onChange={(v) => set("settings", v)}
-                                onError={(bad) => setJsonError("settings", bad)}
+                                onError={(message) => setFieldError("settings", message)}
                             />
                             <JsonField
                                 label="initializationOptions"
                                 hint="Sent verbatim in the initialize request."
                                 value={raw.initializationOptions}
                                 onChange={(v) => set("initializationOptions", v)}
-                                onError={(bad) => setJsonError("initializationOptions", bad)}
+                                onError={(message) => setFieldError("initializationOptions", message)}
                             />
                             <ListField
                                 label="Disabled capabilities"
@@ -675,6 +706,7 @@ function Editor(props: {
                     <KeyValueField
                         value={(raw.env as Record<string, string> | undefined) ?? {}}
                         onChange={(v) => set("env", Object.keys(v).length ? v : undefined)}
+                        onError={(message) => setFieldError("env", message)}
                     />
                 </Section>
             </div>
@@ -801,6 +833,74 @@ function ClientRow(props: { client: ClientInfo }) {
     );
 }
 
+// ---------- problems ----------
+
+function ProblemsView(props: { state: UiState; goto: (kind: Kind, name: string) => void }) {
+    const { notices, unseenNotices } = props.state;
+    // Looking at the tab is what clears the status-bar badge.
+    useEffect(() => {
+        if (unseenNotices > 0) send({ type: "seenNotices" });
+    }, [unseenNotices]);
+    const servers = new Set(props.state.servers.map((s) => s.name));
+    const formatters = new Set(props.state.formatters.map((f) => f.name));
+    // A notice's source links to the entry it's about, when there is one.
+    const target = (source: string): [Kind, string] | undefined => {
+        if (servers.has(source)) return ["server", source];
+        const formatter = source.replace(/^formatter /, "");
+        return source.startsWith("formatter ") && formatters.has(formatter) ? ["formatter", formatter] : undefined;
+    };
+    const errors = notices.filter((n) => n.level === "error").length;
+    return (
+        <div class="problems-page">
+            <div class="buffers-bar">
+                <span class="muted">
+                    {notices.length === 0
+                        ? "Errors and warnings from servers, formatters and settings show up here."
+                        : `${errors} error${errors === 1 ? "" : "s"}, ${notices.length - errors} warning${notices.length - errors === 1 ? "" : "s"}`}
+                </span>
+                <div class="actions">
+                    <button class="btn ghost small" onClick={() => send({ type: "showLog" })}>
+                        <i class="codicon codicon-output" /> Show log
+                    </button>
+                    <button class="btn ghost small" disabled={notices.length === 0} onClick={() => send({ type: "clearNotices" })}>
+                        <i class="codicon codicon-clear-all" /> Clear
+                    </button>
+                </div>
+            </div>
+            {notices.length === 0 ? (
+                <div class="empty">
+                    <i class="codicon codicon-pass" />
+                    <h2>No problems</h2>
+                    <p>Everything General LSP manages is working.</p>
+                </div>
+            ) : (
+                <ul class="notice-list">
+                    {notices.map((n, i) => {
+                        const link = target(n.source);
+                        return (
+                            <li key={n.seq} class={`notice ${i < unseenNotices ? "unseen" : ""}`}>
+                                <i class={`codicon codicon-${n.level} level-${n.level}`} />
+                                {link ? (
+                                    <button class="chip" onClick={() => props.goto(link[0], link[1])}>
+                                        <span class="chip-name">{n.source}</span>
+                                    </button>
+                                ) : (
+                                    <span class="chip static">
+                                        <span class="chip-name">{n.source}</span>
+                                    </span>
+                                )}
+                                <span class="notice-text">{n.message}</span>
+                                {n.count > 1 && <span class="badge">×{n.count}</span>}
+                                <span class="muted notice-time">{clock(n.time)}</span>
+                            </li>
+                        );
+                    })}
+                </ul>
+            )}
+        </div>
+    );
+}
+
 // ---------- processes ----------
 
 function ProcessesView(props: { state: UiState; log?: ShownLog; goto: (kind: Kind, name: string) => void }) {
@@ -821,7 +921,6 @@ function ProcessesView(props: { state: UiState; log?: ShownLog; goto: (kind: Kin
     }, [current?.server]);
     useEffect(() => () => send({ type: "watchLog" }), []);
 
-    const now = useNow();
     if (processes.length === 0) {
         return (
             <div class="empty">
@@ -836,22 +935,22 @@ function ProcessesView(props: { state: UiState; log?: ShownLog; goto: (kind: Kin
     return (
         <div class="split">
             <aside class="sidebar">
-                <ul class="entries" role="listbox">
+                <ul class="entries" aria-label="Running processes">
                     {processes.map((p) => (
-                        <li
-                            class={`entry ${p.id === current?.id ? "active" : ""}`}
-                            role="option"
-                            aria-selected={p.id === current?.id}
-                            tabIndex={0}
-                            onClick={() => select(p)}
-                            onKeyDown={(e) => e.key === "Enter" && select(p)}
-                        >
-                            <span class={`dot ${p.state}`} title={statusText[p.state]} />
-                            <span class="name">{p.server}</span>
-                            <span class="sub">
-                                {p.pid !== undefined ? `pid ${p.pid} · ` : ""}
-                                {uptime(now - p.startedAt)} · {p.files.length} file{p.files.length === 1 ? "" : "s"}
-                            </span>
+                        <li key={p.id} class={`entry ${p.id === current?.id ? "active" : ""}`}>
+                            <button
+                                class="entry-main"
+                                aria-current={p.id === current?.id ? "true" : undefined}
+                                onClick={() => select(p)}
+                            >
+                                <span class={`dot ${p.state}`} title={statusText[p.state]} />
+                                <span class="name">{p.server}</span>
+                                <span class="sub">
+                                    {p.pid !== undefined ? `pid ${p.pid} · ` : ""}
+                                    <Uptime since={p.startedAt} /> · {p.files.length} file
+                                    {p.files.length === 1 ? "" : "s"}
+                                </span>
+                            </button>
                         </li>
                     ))}
                 </ul>
@@ -861,7 +960,6 @@ function ProcessesView(props: { state: UiState; log?: ShownLog; goto: (kind: Kin
                     <ProcessDetail
                         key={current.id}
                         process={current}
-                        now={now}
                         enabled={enabled(current.server)}
                         log={props.log?.server === current.server ? props.log.lines : []}
                         goto={props.goto}
@@ -874,7 +972,6 @@ function ProcessesView(props: { state: UiState; log?: ShownLog; goto: (kind: Kin
 
 function ProcessDetail(props: {
     process: ProcessInfo;
-    now: number;
     enabled: boolean;
     log: LogLine[];
     goto: (kind: Kind, name: string) => void;
@@ -917,7 +1014,7 @@ function ProcessDetail(props: {
                     <div class="kv">
                         <span>Uptime</span>
                         <span>
-                            {uptime(props.now - p.startedAt)}
+                            <Uptime since={p.startedAt} />
                             {p.restarts > 0 && (
                                 <span class="warning">&nbsp;· restarted {p.restarts}× after crashing</span>
                             )}
@@ -1060,7 +1157,7 @@ function LogView(props: { server: string; lines: LogLine[] }) {
                     </div>
                 ) : (
                     shown.slice(-2000).map((l) => (
-                        <div class={`log-line ${l.level}`}>
+                        <div key={l.seq} class={`log-line ${l.level}`}>
                             <span class="log-time">{clock(l.time)}</span>
                             <span class="log-level">{l.level === "output" ? "" : l.level}</span>
                             <span class="log-text">{l.text}</span>
@@ -1072,13 +1169,14 @@ function LogView(props: { server: string; lines: LogLine[] }) {
     );
 }
 
-function useNow(): number {
+// Ticks on its own, so the once-a-second update re-renders this text and not the whole page and its log.
+function Uptime(props: { since: number }) {
     const [now, setNow] = useState(Date.now());
     useEffect(() => {
         const timer = setInterval(() => setNow(Date.now()), 1000);
         return () => clearInterval(timer);
     }, []);
-    return now;
+    return <>{uptime(now - props.since)}</>;
 }
 
 function uptime(ms: number): string {
@@ -1257,14 +1355,28 @@ function chipDot(state: BufferServer["state"]): Status {
 
 // ---------- paths ----------
 
-function PathsView(props: { paths: UiState["extraPaths"] }) {
+function PathsView(props: { paths: UiState["extraPaths"]; checked: Record<string, boolean> }) {
     const initial = props.paths.map((p) => p.path);
     const [paths, setPaths] = useState(initial);
     const dirty = stableJson(paths) !== stableJson(initial);
     useEffect(() => {
         if (!dirty) setPaths(initial);
     }, [stableJson(initial)]);
-    const exists = new Map(props.paths.map((p) => [p.path, p.exists]));
+    const exists = new Map([
+        ...props.paths.map((p): [string, boolean] => [p.path, p.exists]),
+        ...Object.entries(props.checked),
+    ]);
+    // Typed paths are checked too, not only saved ones; debounced so each keystroke doesn't hit the disk.
+    useEffect(() => {
+        const unknown = paths.filter((p) => p && !exists.has(p));
+        if (unknown.length === 0) return;
+        const timer = setTimeout(() => send({ type: "checkPaths", paths: unknown }), 300);
+        return () => clearTimeout(timer);
+    }, [stableJson(paths)]);
+    const save = () => {
+        if (dirty) send({ type: "saveExtraPaths", paths: paths.filter(Boolean) });
+    };
+    useSaveShortcut(save);
     return (
         <div class="paths">
             <Section title="Extra search paths" icon="folder-library">
@@ -1279,7 +1391,7 @@ function PathsView(props: { paths: UiState["extraPaths"] }) {
                     placeholder="~/.local/share/nvim/mason/bin"
                     onChange={setPaths}
                     decorate={(v) =>
-                        v && exists.has(v) && !exists.get(v) ? (
+                        v && exists.get(v) === false ? (
                             <span class="warning" title="Directory does not exist">
                                 <i class="codicon codicon-warning" />
                             </span>
@@ -1292,11 +1404,7 @@ function PathsView(props: { paths: UiState["extraPaths"] }) {
                 <button class="btn secondary" disabled={!dirty} onClick={() => setPaths(initial)}>
                     Revert
                 </button>
-                <button
-                    class="btn"
-                    disabled={!dirty}
-                    onClick={() => send({ type: "saveExtraPaths", paths: paths.filter(Boolean) })}
-                >
+                <button class="btn" disabled={!dirty} onClick={save} title="⌘S / Ctrl+S">
                     Save
                 </button>
             </footer>
@@ -1493,12 +1601,26 @@ function Segmented(props: {
     );
 }
 
+// ⌘S/Ctrl+S saves the form on screen; re-subscribed each render so `save` sees current state.
+function useSaveShortcut(save: () => void): void {
+    useEffect(() => {
+        const onKey = (e: KeyboardEvent) => {
+            if ((e.metaKey || e.ctrlKey) && e.key === "s") {
+                e.preventDefault();
+                save();
+            }
+        };
+        window.addEventListener("keydown", onKey);
+        return () => window.removeEventListener("keydown", onKey);
+    });
+}
+
 function JsonField(props: {
     label: string;
     hint: string;
     value: unknown;
     onChange: (v: unknown) => void;
-    onError: (bad: boolean) => void;
+    onError: (message: string | undefined) => void;
 }) {
     const format = (v: unknown) => (v === undefined ? "" : JSON.stringify(v, null, 2));
     const [text, setText] = useState(format(props.value));
@@ -1520,17 +1642,17 @@ function JsonField(props: {
                     setText(next);
                     if (next.trim() === "") {
                         setError(undefined);
-                        props.onError(false);
+                        props.onError(undefined);
                         props.onChange(undefined);
                         return;
                     }
                     try {
                         props.onChange(JSON.parse(next));
                         setError(undefined);
-                        props.onError(false);
+                        props.onError(undefined);
                     } catch (err) {
                         setError(err instanceof Error ? err.message : String(err));
-                        props.onError(true);
+                        props.onError(`Fix the invalid JSON in ${props.label}.`);
                     }
                 }}
             />
@@ -1543,13 +1665,21 @@ function JsonField(props: {
     );
 }
 
-function KeyValueField(props: { value: Record<string, string>; onChange: (v: Record<string, string>) => void }) {
+function KeyValueField(props: {
+    value: Record<string, string>;
+    onChange: (v: Record<string, string>) => void;
+    onError: (message: string | undefined) => void;
+}) {
     const [rows, setRows] = useState<[string, string][]>(Object.entries(props.value));
     useEffect(() => {
         if (stableJson(Object.fromEntries(rows.filter(([k]) => k))) !== stableJson(props.value)) {
             setRows(Object.entries(props.value));
         }
     }, [stableJson(props.value)]);
+    const names = rows.map(([k]) => k.trim()).filter(Boolean);
+    const duplicate = names.find((k, i) => names.indexOf(k) !== i);
+    // An object can't hold two values for one name; saving would silently keep only the last.
+    useEffect(() => props.onError(duplicate ? `Variable ${duplicate} is set twice.` : undefined), [duplicate]);
     const update = (next: [string, string][]) => {
         setRows(next);
         props.onChange(Object.fromEntries(next.filter(([k]) => k)));
@@ -1560,7 +1690,7 @@ function KeyValueField(props: { value: Record<string, string>; onChange: (v: Rec
                 {rows.map(([k, v], i) => (
                     <div class="list-row kv-row">
                         <input
-                            class="mono"
+                            class={`mono ${k.trim() && k.trim() === duplicate ? "invalid" : ""}`}
                             value={k}
                             placeholder="NAME"
                             onInput={(e) => update(rows.map((r, j) => (j === i ? [e.currentTarget.value, r[1]] : r)))}
@@ -1631,6 +1761,17 @@ function clean(raw: Raw): Raw {
     return Object.fromEntries(
         Object.entries(raw).filter(([, v]) => v !== undefined && !(Array.isArray(v) && v.length === 0)),
     );
+}
+
+// `next` plus every key the draft changed relative to `base`.
+function rebase(draft: Raw, base: Raw, next: Raw): Raw {
+    const result = { ...next };
+    for (const key of new Set([...Object.keys(draft), ...Object.keys(base)])) {
+        if (stableJson(draft[key]) === stableJson(base[key])) continue;
+        if (draft[key] === undefined) delete result[key];
+        else result[key] = draft[key];
+    }
+    return result;
 }
 
 // Key order is irrelevant to settings, so toggling a key off and on again isn't an edit.

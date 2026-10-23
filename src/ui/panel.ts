@@ -2,12 +2,13 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as vscode from "vscode";
 import { State } from "vscode-languageclient/node";
-import which from "which";
 import * as os from "node:os";
 import * as clients from "../clients";
-import { expandHome, expandRootVars, normalizePatterns, readServers, withExtraPaths } from "../config";
+import { expandHome, expandRootVars, isPlainObject, normalizePatterns, readServers, withExtraPaths } from "../config";
+import { findExecutable, isProjectRelative } from "../executables";
 import { formatPlan } from "../formatting";
 import * as logs from "../logs";
+import * as notify from "../notify";
 import { isInside } from "../root";
 import type {
     BufferInfo,
@@ -40,6 +41,7 @@ interface Session {
 
 let panel: vscode.WebviewPanel | undefined;
 let lastActions: PanelActions | undefined;
+let pendingTab: string | undefined;
 
 // Lets tests drive the same handlers the webview uses, without a webview.
 export function dispatch(message: UiMessage): Promise<void> {
@@ -53,12 +55,15 @@ export function webviewReadyCount(): number {
     return readyCount;
 }
 
-export function openSettingsPanel(extensionUri: vscode.Uri, actions: PanelActions): vscode.WebviewPanel {
+export function openSettingsPanel(extensionUri: vscode.Uri, actions: PanelActions, tab?: string): vscode.WebviewPanel {
     lastActions = actions;
     if (panel) {
         panel.reveal();
+        if (tab) void panel.webview.postMessage({ type: "showTab", tab } satisfies HostMessage);
         return panel;
     }
+    // A brand-new webview can't receive messages until its script has booted; send the tab on "ready".
+    pendingTab = tab;
     const webviewRoot = vscode.Uri.joinPath(extensionUri, "dist", "webview");
     const created = vscode.window.createWebviewPanel("generalLsp.settings", "General LSP", vscode.ViewColumn.Active, {
         enableScripts: true,
@@ -71,9 +76,15 @@ export function openSettingsPanel(extensionUri: vscode.Uri, actions: PanelAction
 
     // Server state flips several times per start; one update per burst is enough.
     let timer: NodeJS.Timeout | undefined;
+    // Building the state touches the filesystem, so a hidden panel only notes that it is stale.
+    let stale = false;
     const post = (message: HostMessage) => void created.webview.postMessage(message);
     const postState = () => {
         clearTimeout(timer);
+        if (!created.visible) {
+            stale = true;
+            return;
+        }
         timer = setTimeout(() => post({ type: "state", state: uiState() }), 50);
     };
 
@@ -102,6 +113,13 @@ export function openSettingsPanel(extensionUri: vscode.Uri, actions: PanelAction
             logTimer ??= setTimeout(flushLog, 100);
         }),
         clients.onDidChange(postState),
+        notify.onDidChange(postState),
+        created.onDidChangeViewState(() => {
+            if (created.visible && stale) {
+                stale = false;
+                postState();
+            }
+        }),
         vscode.workspace.onDidChangeConfiguration((e) => {
             if (e.affectsConfiguration("generalLsp")) postState();
         }),
@@ -115,10 +133,13 @@ export function openSettingsPanel(extensionUri: vscode.Uri, actions: PanelAction
                 if (message.type === "ready") {
                     readyCount++;
                     post({ type: "state", state: uiState() });
+                    if (pendingTab) post({ type: "showTab", tab: pendingTab });
+                    pendingTab = undefined;
                 }
                 else await handle(message, actions, session);
             } catch (err) {
-                post({ type: "error", message: err instanceof Error ? err.message : String(err) });
+                post({ type: "error", message: notify.errorText(err) });
+                notify.error("settings UI", err, `'${message.type}' failed`);
             }
         }),
     ];
@@ -182,6 +203,19 @@ async function handle(message: UiMessage, actions: PanelActions, session: Sessio
             return;
         case "saveExtraPaths":
             return store.saveExtraPaths(message.paths);
+        case "seenNotices":
+            notify.markSeen();
+            return session.post({ type: "noticesSeen" });
+        case "clearNotices":
+            return notify.clear();
+        case "showLog":
+            return notify.log().show();
+        case "checkPaths":
+            session.post({
+                type: "pathsChecked",
+                exists: Object.fromEntries(message.paths.map((p) => [p, fs.existsSync(expandHome(p))])),
+            });
+            return;
     }
 }
 
@@ -192,6 +226,9 @@ export function uiState(): UiState {
         formatters: store.entries("formatter").map((e) => entry("formatter", e.name, e.scope, e.raw)),
         buffers: buffers(),
         processes: processes(),
+        notices: notify.list(),
+        unseenNotices: notify.unseenCount(),
+        unseenSeverity: notify.unseenSeverity(),
         extraPaths: extraPaths.map((p) => ({ path: p, exists: fs.existsSync(expandHome(p)) })),
         hasWorkspace: (vscode.workspace.workspaceFolders?.length ?? 0) > 0,
     };
@@ -296,7 +333,7 @@ function effectiveConfig(rc: clients.RunningClient): Raw {
         command: rc.argv,
         cwd: rc.root,
         venv: rc.venv,
-        env: rc.envOverrides,
+        env: withInheritedPath(rc.envOverrides),
         languages: s.languages,
         filePatterns: s.filePatterns,
         rootMarkers: s.rootMarkers,
@@ -316,6 +353,13 @@ function effectiveConfig(rc: clients.RunningClient): Raw {
                 !(v !== null && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length === 0),
         ),
     );
+}
+
+// VS Code's own PATH is long and the same for every server; "$PATH" leaves only what this server adds.
+function withInheritedPath(env: Record<string, string>): Record<string, string> {
+    const inherited = process.env.PATH;
+    if (!env.PATH || !inherited || !env.PATH.includes(inherited)) return env;
+    return { ...env, PATH: env.PATH.replace(inherited, "$PATH") };
 }
 
 function clientState(rc: clients.RunningClient): ClientInfo["state"] {
@@ -346,9 +390,14 @@ function status(raw: Raw, binary: Entry["binary"], infos: ClientInfo[]): Status 
 function resolveBinary(raw: Raw): Entry["binary"] {
     const command = Array.isArray(raw.command) ? (raw.command as unknown[]) : [];
     if (typeof command[0] !== "string" || command[0] === "") return null;
-    if (command[0].includes("${root")) return undefined;
-    const env = withExtraPaths(raw.env as Record<string, string> | undefined);
-    return which.sync(expandHome(command[0]), { nothrow: true, path: env.PATH ?? process.env.PATH }) ?? null;
+    // Root-dependent commands can only be resolved once a file picks a root.
+    if (command[0].includes("${root") || isProjectRelative(command[0])) return undefined;
+    const env = isPlainEnv(raw.env) ? withExtraPaths(raw.env) : withExtraPaths(undefined);
+    return findExecutable(expandHome(command[0]), env.PATH);
+}
+
+function isPlainEnv(v: unknown): v is Record<string, string> {
+    return isPlainObject(v) && Object.values(v).every((x) => typeof x === "string");
 }
 
 function html(webview: vscode.Webview, root: vscode.Uri): string {

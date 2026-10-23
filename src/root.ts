@@ -17,12 +17,12 @@ export function findRoot(file: string, markers: RootMarker[]): string | undefine
 
 // Nearest virtualenv at or above the root, like the one an activated shell would have; uv workspaces keep it at the top.
 export function findVenv(root: string, names: string[]): string | undefined {
-    for (let dir = root; ; dir = path.dirname(dir)) {
-        for (const name of names) {
-            if (fs.existsSync(path.join(dir, name, "pyvenv.cfg"))) return path.join(dir, name);
-        }
-        if (path.dirname(dir) === dir) return undefined;
+  for (let dir = root; ; dir = path.dirname(dir)) {
+    for (const name of names) {
+      if (fs.existsSync(path.join(dir, name, "pyvenv.cfg"))) return path.join(dir, name);
     }
+    if (path.dirname(dir) === dir) return undefined;
+  }
 }
 
 export function isInside(file: string, root: string): boolean {

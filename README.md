@@ -30,14 +30,14 @@ runs for which file and where its root is.
 
 | Field | Meaning |
 | --- | --- |
-| `command` | Executable + args. Must be on `PATH` (or `env.PATH`), or an absolute path. |
+| `command` | Executable + args: on `PATH` (or `env.PATH`/`extraPaths`), absolute, or `./…` relative to the root. |
 | `languages` | VS Code language IDs. |
-| `filePatterns` | Globs on the file path; a bare `*.zig` means `**/*.zig`. |
+| `filePatterns` | Globs on the file path; unless absolute or starting with `**/`, they match at any depth (`*.zig` → `**/*.zig`). |
 | `rootMarkers` | Tried in priority order; a nested array is one equal-priority group. Globs like `*.csproj` work. |
 | `singleFileSupport` | Default `true`. If `false` and no marker is found, the server does not attach. |
 | `fallbackRoot` | Root for files with no marker, e.g. an empty scratch dir so a loose `.rs` file doesn't index `~`. |
 | `venv` | `true` (or a list of folder names): launch as if the nearest Python virtualenv (`.venv`, `venv`, `env`, at or above the root) were activated — `VIRTUAL_ENV` set and its `bin` first on `PATH`, which also resolves `command`. What an activated shell gives nvim. Roots with different venvs get separate processes. |
-| `settings` | Answers `workspace/configuration` and is pushed via `didChangeConfiguration`. Nested or dotted keys. |
+| `settings` | Answers `workspace/configuration` and is pushed via `didChangeConfiguration`. Nested, or dotted top-level keys (`"rust-analyzer.check.command"`); deeper keys such as `yaml.schemas` URLs keep their dots. |
 | `disabledCapabilities` | Capabilities stripped from the `initialize` result, like `server_capabilities.X = false` in `on_init`. |
 | `format` | `fallback` (default): formats only files no CLI formatter matches. `prefer`: formats its files even then. `never`: never formats. |
 | `multiRoot` | Default `true`: a new root joins a running client as a workspace folder when the server supports it. `false`: one client per root (nvim's default). |
@@ -60,6 +60,25 @@ spawned. A small watchdog process notices the extension host disappearing via st
 
 `generalLsp.extraPaths` lists directories searched after `PATH` (e.g. `~/.local/share/nvim/mason/bin`), so
 commands can be bare names whether they're installed globally or by Mason.
+
+`generalLsp.idleTimeout` (seconds, default `0` = never) stops a server once its last attached file has been closed
+for that long.
+
+An entry with a wrongly typed field (say `"languages": "rust"`) is skipped and reported; the others keep working.
+
+## Problems and notifications
+
+Errors and warnings from General LSP itself are reported in one place:
+
+- A notification with **Show problems** / **Show log** — at most once per 5 minutes for the same problem, so format on
+  save or a crash loop doesn't flood you.
+- The status bar item shows an error/warning badge with the number of unseen problems, even where no server is
+  attached; clicking it opens the **Problems** tab.
+- The *General LSP* output channel logs every one.
+
+Reported: invalid settings entries, missing executables, servers that fail to start, crash and get restarted, or stop
+for good, formatter failures and timeouts, formatters that aren't installed and server commands owned by another
+extension (these last two are listed without a pop-up), and unexpected internal errors.
 
 ## Formatters
 
@@ -88,7 +107,9 @@ Command-line formatters, matched the same way as servers, in the spirit of confo
   attached to it has `"format": "prefer"`; otherwise the first server in settings order that can format it does.
   Range formatting (format on paste) is LSP-only.
 - An uninstalled formatter is skipped; a failing one aborts the chain and leaves the file untouched. Both are logged
-  to the *General LSP: formatters* output channel.
+  to the *General LSP: formatters* output channel and listed under Problems.
+- `timeout` (ms, default 10000) kills a formatter that hangs, like conform's `timeout_ms`.
+- `./…` commands run relative to the formatter's working directory, e.g. `["./node_modules/.bin/prettier", …]`.
 - `rootMarkers` sets the working directory and `${root}`; `requireRoot` skips the formatter without one.
 - The extension registers a single formatting provider, so it can be the `editor.defaultFormatter` for any of these
   languages without VS Code asking which formatter to use.
@@ -106,6 +127,8 @@ paths, without touching settings.json by hand:
   working dir, venv, workspace folders, attached files, advertised capabilities (stripped ones struck through), the
   effective config with variables expanded, and a live log tail (filter, level, follow). **Stop** turns that one
   process off until a matching file opens again or **Reload all**; **Disable** turns the server off in settings.
+- **Problems** lists recent errors and warnings, newest first, with their source (linking to that server or
+  formatter), time and repeat count.
 - Live state per server: running/starting/stopped/not installed, the resolved executable, each process's pid,
   workspace folders and number of attached files, with restart/stop/output buttons.
 - Forms for every option, a JSON editor with validation for `settings`/`initializationOptions`, and a key/value
@@ -139,4 +162,7 @@ VSCODE_PATH="/Applications/Visual Studio Code.app/Contents/MacOS/Code" bun run t
 bun run package      # .vsix
 ```
 
-Tests need `gopls` and `clangd` on `PATH`.
+Tests need `gopls`, `clangd` and `node` on `PATH`, and run on macOS/Linux. `ONLY=<regex>` runs a subset (tests still
+run in order, so pick ones that don't rely on earlier ones) and `DEBUG_TESTS=1` prints when each starts.
+`test/fixture/bin/glsp-fake-server` is a tiny LSP server for cases real servers can't trigger on demand: slow starts,
+crash loops, dynamically registered commands and stderr without a trailing newline.

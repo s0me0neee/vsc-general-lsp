@@ -3,6 +3,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import {
     CancellationToken,
+    CloseAction,
     DidChangeConfigurationNotification,
     DidChangeWorkspaceFoldersNotification,
     DidOpenTextDocumentNotification,
@@ -15,16 +16,18 @@ import {
     WorkspaceFoldersRequest,
     vsdiag,
     type DocumentSelector,
+    type ErrorHandler,
     type LanguageClientOptions,
     type MessageReader,
     type Middleware,
     type ServerOptions,
     type WorkspaceFolder,
 } from "vscode-languageclient/node";
-import which from "which";
 import { expandRootVars, lookupSection, type ServerConfig } from "./config";
-import { reap, spawnServer } from "./processes";
+import { findExecutable, relativeTo } from "./executables";
 import * as logs from "./logs";
+import * as notify from "./notify";
+import { reap, spawnServer } from "./processes";
 import { findRoot, findVenv } from "./root";
 
 export type FormatKind = "document" | "range";
@@ -57,6 +60,9 @@ export interface RunningClient {
     ready: Promise<void>;
     // Formatting is taken away from languageclient so the extension exposes one provider per file.
     formatting: { static: Set<FormatKind>; dynamic: Map<string, FormatKind> };
+    // Command ids per dynamic registration id, so an unregistration removes exactly those.
+    dynamicCommands: Map<string, string[]>;
+    idleTimer?: NodeJS.Timeout;
 }
 
 interface Placement {
@@ -109,8 +115,8 @@ const running = new Set<RunningClient>();
 let nextId = 1;
 // Server name + root → the client serving it; pending while a host decides whether to take the folder.
 const roots = new Map<string, Promise<RunningClient | undefined>>();
-const outputs = new Map<string, vscode.LogOutputChannel>();
-const reportedMissing = new Set<string>();
+// Bumped on settings change, so placements still waiting on a host give up instead of using stale config.
+let configVersion = 0;
 const changed = new vscode.EventEmitter<void>();
 // Server command ids are global in VS Code; each is registered once and routed to one of its owners.
 const commands = new Map<string, { owners: Set<RunningClient>; registration: vscode.Disposable }>();
@@ -172,9 +178,31 @@ export function attach(server: ServerConfig, doc: vscode.TextDocument): void {
     });
 }
 
+// Called before re-reading settings: placements still waiting on a host would otherwise finish with stale config.
+export function settingsChanged(): void {
+    configVersion++;
+    // Only roots a client already serves stay; pending ones re-place with the new config.
+    const served = new Set([...running].flatMap((rc) => rc.folders.map((f) => rootKey(rc.server.name, f))));
+    for (const key of roots.keys()) if (!served.has(key)) roots.delete(key);
+}
+
+// Ownership ends when the file closes, even if the client isn't running and languageclient never reports it.
+export function forget(doc: vscode.TextDocument): void {
+    const uri = doc.uri.toString();
+    let owned = false;
+    for (const rc of running) {
+        if (!rc.docs.delete(uri)) continue;
+        owned = true;
+        scheduleIdleStop(rc);
+    }
+    // Git, output and diff documents close constantly and never belong to a client.
+    if (owned) changed.fire();
+}
+
 export async function stop(rc: RunningClient): Promise<void> {
     // Removed synchronously so a reattach in the same tick spawns a fresh client.
     running.delete(rc);
+    clearTimeout(rc.idleTimer);
     for (const folder of rc.folders) roots.delete(rootKey(rc.server.name, folder));
     removeCommands(rc);
     changed.fire();
@@ -191,22 +219,11 @@ export async function stopAll(): Promise<void> {
     await Promise.all(runningClients().map(stop));
 }
 
-export function forgetMissing(): void {
-    reportedMissing.clear();
-}
-
 export function output(name: string): vscode.LogOutputChannel {
-    let channel = outputs.get(name);
-    if (!channel) {
-        channel = logs.capture(name, vscode.window.createOutputChannel(`General LSP: ${name}`, { log: true }));
-        outputs.set(name, channel);
-    }
-    return channel;
+    return logs.channel(name, `General LSP: ${name}`);
 }
 
-export function disposeOutputs(): void {
-    outputs.forEach((o) => o.dispose());
-    outputs.clear();
+export function dispose(): void {
     changed.dispose();
 }
 
@@ -231,10 +248,7 @@ function rootOnly(server: ServerConfig, uri: vscode.Uri): Placement | undefined 
     const file = uri.fsPath;
     const markerRoot = server.rootMarkers.length > 0 ? findRoot(file, server.rootMarkers) : undefined;
     if (markerRoot) return { root: markerRoot, isolated: false };
-    if (server.fallbackRoot) {
-        fs.mkdirSync(server.fallbackRoot, { recursive: true });
-        return { root: server.fallbackRoot, isolated: true };
-    }
+    if (server.fallbackRoot) return { root: server.fallbackRoot, isolated: true };
     // Without single-file support, markers gate attachment (e.g. denols only under deno.json).
     if (server.rootMarkers.length > 0 && !server.singleFileSupport) return undefined;
     const folder = vscode.workspace.getWorkspaceFolder(uri)?.uri.fsPath;
@@ -257,7 +271,10 @@ async function place(server: ServerConfig, placement: Placement): Promise<Runnin
             (rc) => rc.server.name === server.name && !rc.isolated && rc.venv === placement.venv,
         );
         if (host) {
+            const version = configVersion;
             await host.ready;
+            // Settings changed while waiting: give up, and let the reattach that follows place this root afresh.
+            if (version !== configVersion) return undefined;
             if (running.has(host) && host.canAddFolders) {
                 addFolder(host, placement.root);
                 return host;
@@ -271,8 +288,9 @@ function spawn(server: ServerConfig, placement: Placement): RunningClient | unde
     const [cmd, ...args] = server.command.map((arg) => expandRootVars(arg, placement.root));
     const env = activate(server.env, placement.venv);
     // Resolved against the activated PATH, so a project-pinned ruff/ty in the venv wins.
-    const resolved = resolveCommand(server, cmd, env.PATH);
+    const resolved = resolveCommand(server, relativeTo(placement.root, cmd), env.PATH);
     if (!resolved) return undefined;
+    if (placement.isolated) fs.mkdirSync(placement.root, { recursive: true });
     const rc = {
         id: nextId++,
         server,
@@ -290,11 +308,11 @@ function spawn(server: ServerConfig, placement: Placement): RunningClient | unde
         canAddFolders: false,
         started: false,
         formatting: { static: new Set(), dynamic: new Map() },
+        dynamicCommands: new Map(),
     } as unknown as RunningClient;
     rc.client = createClient(rc, [resolved, ...args], env);
     running.add(rc);
-    rc.client.onDidChangeState(({ oldState, newState }) => {
-        if (oldState === State.Running && newState === State.Starting) rc.restarts++;
+    rc.client.onDidChangeState(({ newState }) => {
         if (newState === State.Running) {
             // After the state flips, languageclient still sends `initialized` and opens what it owns in this tick.
             setTimeout(() => {
@@ -323,6 +341,7 @@ function addFolder(rc: RunningClient, root: string): void {
 function assign(rc: RunningClient, doc: vscode.TextDocument): void {
     if (doc.isClosed || !running.has(rc)) return;
     rc.docs.add(doc.uri.toString());
+    clearTimeout(rc.idleTimer);
     // languageclient already skipped this file's didOpen while it had no owner.
     if (rc.started) flushOpens(rc);
     changed.fire();
@@ -342,17 +361,49 @@ function workspaceFolder(root: string): WorkspaceFolder {
     return { uri: vscode.Uri.file(root).toString(), name: path.basename(root) };
 }
 
+// Optional, like nvim's behaviour by default: servers otherwise keep running after their last file closes.
+// languageclient's own restart policy, reporting what it decided when the process died on its own.
+function crashReporter(rc: RunningClient): ErrorHandler {
+    let fallback: ErrorHandler | undefined;
+    const policy = () => (fallback ??= rc.client.createDefaultErrorHandler());
+    return {
+        error: (err, message, count) => policy().error(err, message, count),
+        closed: async () => {
+            const result = await policy().closed();
+            // stop() removes the client from `running` first, so only stops we didn't ask for count.
+            if (!running.has(rc)) return result;
+            if (result.action === CloseAction.Restart) {
+                rc.restarts++;
+                notify.report("warning", rc.server.name, `crashed and was restarted (${rc.restarts}× so far)`, {
+                    key: `crash:${rc.server.name}`,
+                });
+            } else {
+                notify.report(
+                    "error",
+                    rc.server.name,
+                    "stopped unexpectedly and won't be restarted until you restart it or use Reload all",
+                );
+            }
+            return result;
+        },
+    };
+}
+
+function scheduleIdleStop(rc: RunningClient): void {
+    clearTimeout(rc.idleTimer);
+    const seconds = vscode.workspace.getConfiguration("generalLsp").get<number>("idleTimeout", 0);
+    if (seconds <= 0 || rc.docs.size > 0) return;
+    rc.idleTimer = setTimeout(() => {
+        if (running.has(rc) && rc.docs.size === 0) void stop(rc);
+    }, seconds * 1000);
+}
+
 function resolveCommand(server: ServerConfig, cmd: string, searchPath: string | undefined): string | undefined {
-    const resolved = which.sync(cmd, { nothrow: true, path: searchPath });
+    const resolved = findExecutable(cmd, searchPath);
     if (resolved) return resolved;
-    if (!reportedMissing.has(server.name)) {
-        reportedMissing.add(server.name);
-        void vscode.window
-            .showErrorMessage(`General LSP: '${cmd}' for server '${server.name}' was not found on PATH.`, "Open Settings")
-            .then((choice) => {
-                if (choice) void vscode.commands.executeCommand("generalLsp.openSettings");
-            });
-    }
+    notify.report("error", server.name, `'${cmd}' was not found on PATH or in generalLsp.extraPaths`, {
+        key: `missing:${server.name}`,
+    });
     return undefined;
 }
 
@@ -393,6 +444,7 @@ function ownershipMiddleware(rc: RunningClient): Middleware {
             const uri = doc.uri.toString();
             rc.docs.delete(uri);
             if (rc.opened.delete(uri)) await next(doc);
+            scheduleIdleStop(rc);
             changed.fire();
         },
     } as Middleware;
@@ -410,7 +462,10 @@ function createClient(rc: RunningClient, argv: string[], serverEnv: Record<strin
     const serverOptions: ServerOptions = async () => {
         const child = await spawnServer(argv[0], argv.slice(1), root, env);
         rc.pid = child.pid;
-        child.stderr!.on("data", (data) => channel.append(String(data)));
+        const stderr = logs.lineSplitter((text) => channel.appendLine(text));
+        child.stderr!.on("data", (data) => stderr.write(String(data)));
+        // A crash message often lacks its final newline; show it rather than hold it back.
+        child.on("exit", () => stderr.flush());
         const reader = onInitializeResult(new StreamMessageReader(child.stdout!), (capabilities) => {
             rc.advertised = Object.keys(capabilities).filter((k) => k.endsWith("Provider") && capabilities[k]);
             for (const name of server.disabledCapabilities) delete capabilities[name];
@@ -435,6 +490,7 @@ function createClient(rc: RunningClient, argv: string[], serverEnv: Record<strin
         initializationOptions: expandRootVars(server.initializationOptions, root),
         outputChannel: channel,
         revealOutputChannelOn: RevealOutputChannelOn.Never,
+        errorHandler: crashReporter(rc),
         middleware: {
             ...ownershipMiddleware(rc),
             workspace: {
@@ -447,6 +503,13 @@ function createClient(rc: RunningClient, argv: string[], serverEnv: Record<strin
                         rc.canAddFolders = true;
                         return false;
                     }
+                    // Dynamic commands would also be registered globally by languageclient; route them like static ones.
+                    if (r.method === ExecuteCommandRequest.method) {
+                        const ids = (r.registerOptions as { commands?: string[] } | undefined)?.commands ?? [];
+                        rc.dynamicCommands.set(r.id, ids);
+                        addCommands(rc, ids);
+                        return false;
+                    }
                     const kind = formatMethods[r.method];
                     if (kind) rc.formatting.dynamic.set(r.id, kind);
                     return !kind;
@@ -455,9 +518,15 @@ function createClient(rc: RunningClient, argv: string[], serverEnv: Record<strin
                 await next({ registrations }, CancellationToken.None);
             },
             handleUnregisterCapability: async (params, next) => {
-                const unregisterations = params.unregisterations.filter(
-                    (u) => u.method !== DidChangeWorkspaceFoldersNotification.method && !rc.formatting.dynamic.delete(u.id),
-                );
+                const unregisterations = params.unregisterations.filter((u) => {
+                    const ids = rc.dynamicCommands.get(u.id);
+                    if (ids) {
+                        rc.dynamicCommands.delete(u.id);
+                        removeCommands(rc, ids);
+                        return false;
+                    }
+                    return u.method !== DidChangeWorkspaceFoldersNotification.method && !rc.formatting.dynamic.delete(u.id);
+                });
                 changed.fire();
                 await next({ unregisterations }, CancellationToken.None);
             },
@@ -490,7 +559,12 @@ function onInitializeResult(reader: MessageReader, edit: (capabilities: Record<s
             reader.listen((message) => {
                 const capabilities = (message as { result?: { capabilities?: Record<string, unknown> } }).result
                     ?.capabilities;
-                if (capabilities) edit(capabilities);
+                // A throw here would swallow the initialize result and leave the server hanging forever.
+                try {
+                    if (capabilities) edit(capabilities);
+                } catch (err) {
+                    notify.error("general-lsp", err, "adjusting a server's capabilities failed");
+                }
                 callback(message);
             }),
         dispose: () => reader.dispose(),
@@ -502,11 +576,23 @@ function addCommands(rc: RunningClient, ids: string[]): void {
         let entry = commands.get(id);
         if (!entry) {
             const owners = new Set<RunningClient>();
-            const registration = vscode.commands.registerCommand(id, (...args: unknown[]) => {
-                const doc = vscode.window.activeTextEditor?.document;
-                const target = (doc && clientsFor(doc).find((c) => owners.has(c))) ?? owners.values().next().value;
-                return target?.client.sendRequest(ExecuteCommandRequest.type, { command: id, arguments: args });
-            });
+            let registration: vscode.Disposable;
+            try {
+                registration = vscode.commands.registerCommand(id, (...args: unknown[]) => {
+                    const doc = vscode.window.activeTextEditor?.document;
+                    const target = (doc && clientsFor(doc).find((c) => owners.has(c))) ?? owners.values().next().value;
+                    return target?.client.sendRequest(ExecuteCommandRequest.type, { command: id, arguments: args });
+                });
+            } catch {
+                // Another extension owns this id (e.g. the Ruff extension's ruff.applyFormat); it keeps it.
+                notify.report(
+                    "warning",
+                    rc.server.name,
+                    `command '${id}' already belongs to another extension, which keeps handling it`,
+                    { toast: false },
+                );
+                continue;
+            }
             entry = { owners, registration };
             commands.set(id, entry);
         }
@@ -514,8 +600,9 @@ function addCommands(rc: RunningClient, ids: string[]): void {
     }
 }
 
-function removeCommands(rc: RunningClient): void {
+function removeCommands(rc: RunningClient, ids?: string[]): void {
     for (const [id, entry] of commands) {
+        if (ids && !ids.includes(id)) continue;
         entry.owners.delete(rc);
         if (entry.owners.size > 0) continue;
         entry.registration.dispose();
@@ -533,5 +620,7 @@ async function start(rc: RunningClient): Promise<void> {
         }
     } catch (err) {
         output(rc.server.name).error(`Failed to start in ${rc.root}: ${err}`);
+        // Stopping a client mid-start rejects too; that one was asked for.
+        if (running.has(rc)) notify.error(rc.server.name, err, `failed to start in ${rc.root}`);
     }
 }

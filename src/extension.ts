@@ -2,9 +2,11 @@ import * as vscode from "vscode";
 import { State } from "vscode-languageclient/node";
 import * as clients from "./clients";
 import { readFormatters, readServers, sameConfig, type ServerConfig } from "./config";
+import { forgetExecutables } from "./executables";
 import * as formatting from "./formatting";
 import { startWatchdog } from "./processes";
 import * as logs from "./logs";
+import * as notify from "./notify";
 import { dispatch, openSettingsPanel, uiState, webviewReadyCount, type PanelActions } from "./ui/panel";
 import * as store from "./ui/store";
 
@@ -29,9 +31,14 @@ export function activate(context: vscode.ExtensionContext) {
   status.command = "generalLsp.openSettings";
   context.subscriptions.push(
     status,
-    { dispose: clients.disposeOutputs },
+    { dispose: clients.dispose },
     { dispose: formatting.dispose },
+    { dispose: logs.dispose },
+    { dispose: notify.dispose },
+    notify.onDidChange(updateStatus),
+    notify.onDidChangeSeen(updateStatus),
     vscode.workspace.onDidOpenTextDocument(attachDocument),
+    vscode.workspace.onDidCloseTextDocument(clients.forget),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("generalLsp")) reload();
     }),
@@ -45,10 +52,21 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand("generalLsp.reloadAll", reloadAll),
     vscode.commands.registerCommand("generalLsp.enable", (name?: string) => setEnabled(true, name)),
     vscode.commands.registerCommand("generalLsp.disable", (name?: string) => setEnabled(false, name)),
-    vscode.commands.registerCommand("generalLsp.openSettings", () => openSettingsPanel(context.extensionUri, panelActions)),
+    vscode.commands.registerCommand("generalLsp.openSettings", (tab?: string) =>
+      openSettingsPanel(context.extensionUri, panelActions, typeof tab === "string" ? tab : undefined),
+    ),
   );
   reload();
-  return { runningClients: clients.runningClients, uiState, store, webviewReadyCount, dispatch, logs };
+  return {
+    runningClients: clients.runningClients,
+    uiState,
+    store,
+    webviewReadyCount,
+    dispatch,
+    logs,
+    notices: notify.list,
+    readServers,
+  };
 }
 
 function clientsOf(name: string): clients.RunningClient[] {
@@ -59,17 +77,29 @@ export function deactivate(): Promise<void> {
   return clients.stopAll();
 }
 
+// A bug here would otherwise silently leave every server unattached, so it's reported instead.
 function reload(): void {
-  const next = readServers();
-  for (const rc of clients.runningClients()) {
-    const updated = next.get(rc.server.name);
-    if (!updated || !sameConfig(updated, rc.server)) void clients.stop(rc);
-    else rc.server = updated;
+  try {
+    clients.settingsChanged();
+    forgetExecutables();
+    notify.forgetToasts();
+    const problems: string[] = [];
+    const next = readServers(problems);
+    const nextFormatters = readFormatters(problems);
+    // Invalid entries are skipped, so say which ones instead of letting them silently do nothing.
+    for (const problem of problems) notify.report("warning", "settings", problem);
+    for (const rc of clients.runningClients()) {
+      const updated = next.get(rc.server.name);
+      if (!updated || !sameConfig(updated, rc.server)) void clients.stop(rc);
+      else rc.server = updated;
+    }
+    servers = next;
+    logs.retain(new Set([...next.keys(), "formatters", "general-lsp"]));
+    formatting.setFormatters(nextFormatters);
+    attachAll();
+  } catch (err) {
+    notify.error("general-lsp", err, "loading settings failed");
   }
-  servers = next;
-  clients.forgetMissing();
-  formatting.setFormatters(readFormatters());
-  attachAll();
 }
 
 function attachAll(): void {
@@ -77,19 +107,39 @@ function attachAll(): void {
 }
 
 function attachDocument(doc: vscode.TextDocument): void {
-  for (const server of servers.values()) clients.attach(server, doc);
+  for (const server of servers.values()) {
+    try {
+      clients.attach(server, doc);
+    } catch (err) {
+      notify.error(server.name, err, `attaching to ${vscode.workspace.asRelativePath(doc.uri)} failed`);
+    }
+  }
 }
 
 function updateStatus(): void {
   const doc = vscode.window.activeTextEditor?.document;
   const attached = doc ? clients.clientsFor(doc) : [];
-  if (attached.length === 0) {
+  const problems = notify.unseenCount();
+  // Problems keep the item visible even where no server is attached.
+  if (attached.length === 0 && problems === 0) {
     status.hide();
     return;
   }
-  status.text = `$(server-process) ${attached.map((rc) => rc.server.name).join(", ")}`;
-  status.tooltip = attached
-    .map((rc) => `${rc.server.name} (${State[rc.client.state]}): ${rc.folders.join(", ")}`)
+  const hasError = notify.unseenSeverity() === "error";
+  status.text = [
+    attached.length > 0 && `$(server-process) ${attached.map((rc) => rc.server.name).join(", ")}`,
+    problems > 0 && `$(${hasError ? "error" : "warning"}) ${problems}`,
+  ]
+    .filter(Boolean)
+    .join("  ");
+  status.backgroundColor =
+    problems > 0 ? new vscode.ThemeColor(hasError ? "statusBarItem.errorBackground" : "statusBarItem.warningBackground") : undefined;
+  status.command = problems > 0 ? { command: "generalLsp.openSettings", title: "Show problems", arguments: ["problems"] } : "generalLsp.openSettings";
+  status.tooltip = [
+    ...attached.map((rc) => `${rc.server.name} (${State[rc.client.state]}): ${rc.folders.join(", ")}`),
+    problems > 0 ? `${problems} new problem${problems === 1 ? "" : "s"} — click to see them` : "",
+  ]
+    .filter(Boolean)
     .join("\n");
   status.show();
 }

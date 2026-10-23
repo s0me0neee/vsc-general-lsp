@@ -31,7 +31,7 @@ async function launch(mode) {
       vscodeExecutablePath: process.env.VSCODE_PATH,
       extensionDevelopmentPath: root,
       extensionTestsPath: path.join(root, "test/suite.cjs"),
-      extensionTestsEnv: { FIXTURE: workspace, MODE: mode },
+      extensionTestsEnv: { FIXTURE: workspace, MODE: mode, ONLY: process.env.ONLY ?? "", DEBUG_TESTS: process.env.DEBUG_TESTS ?? "" },
       launchArgs: [workspace, "--disable-extensions", "--disable-workspace-trust"],
     });
   } catch {
@@ -39,7 +39,9 @@ async function launch(mode) {
     ok = mode === "kill";
   }
   try {
-    const serverPid = Number(fs.readFileSync(path.join(workspace, "gomod/server.pid"), "utf8"));
+    // An ONLY= run may never start gopls; then only the stragglers are checked.
+    const pidFile = path.join(workspace, "gomod/server.pid");
+    const serverPid = fs.existsSync(pidFile) ? Number(fs.readFileSync(pidFile, "utf8")) : 0;
     ok = (await serversGone(serverPid, mode)) && ok;
   } finally {
     fs.rmSync(workspace, { recursive: true, force: true });
@@ -66,6 +68,7 @@ async function serversGone(serverPid, mode) {
 }
 
 function isAlive(pid) {
+  if (!pid) return false;
   try {
     process.kill(pid, 0);
     return true;

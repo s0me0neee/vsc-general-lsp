@@ -2,7 +2,7 @@
 	"name": "general-lsp",
 	"displayName": "General LSP",
 	"description": "Attach any language server to any file, configured like nvim-lspconfig.",
-	"version": "0.0.8",
+	"version": "0.0.9",
 	"publisher": "maot27",
 	"license": "MIT",
 	"engines": {
@@ -65,6 +65,12 @@
 		"configuration": {
 			"title": "General LSP",
 			"properties": {
+				"generalLsp.idleTimeout": {
+					"type": "number",
+					"default": 0,
+					"minimum": 0,
+					"markdownDescription": "Stop a server this many seconds after its last attached file closes. `0` keeps servers running, like nvim."
+				},
 				"generalLsp.extraPaths": {
 					"type": "array",
 					"items": {
@@ -146,6 +152,11 @@
 									0
 								],
 								"markdownDescription": "Exit codes that mean success."
+							},
+							"timeout": {
+								"type": "number",
+								"default": 10000,
+								"markdownDescription": "Milliseconds before the formatter is killed and the file left unchanged (conform's `timeout_ms`)."
 							},
 							"env": {
 								"type": "object",
@@ -296,7 +307,7 @@
 		"picomatch": "4.0.7",
 		"preact": "10.29.8",
 		"vscode-languageclient": "11.0.0",
-		"which": "7.0.0"
+		"which": "5.0.0"
 	},
 	"devDependencies": {
 		"@types/node": "22",

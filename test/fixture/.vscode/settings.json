@@ -22,6 +22,36 @@
       "filePatterns": ["*.probe"],
       "rootMarkers": ["pyproject.toml"],
       "venv": true
+    },
+    "fake": {
+      "command": ["glsp-fake-server"],
+      "filePatterns": ["*.fake"],
+      "rootMarkers": ["fake.root"],
+      "multiRoot": false
+    },
+    "fake-slow": {
+      "command": ["glsp-fake-server"],
+      "languages": ["ini"],
+      "rootMarkers": ["fake.root"],
+      "env": { "FAKE_INIT_DELAY": "4000" }
+    },
+    "fake-race": {
+      "command": ["glsp-fake-server"],
+      "languages": ["properties"],
+      "rootMarkers": ["fake.root"],
+      "env": { "FAKE_INIT_DELAY": "2500" },
+      "settings": { "v": 1 }
+    },
+    "fake-idle": {
+      "command": ["glsp-fake-server"],
+      "languages": ["bat"],
+      "rootMarkers": ["fake.root"]
+    },
+    "fake-crash": {
+      "command": ["glsp-fake-server"],
+      "filePatterns": ["*.crash"],
+      "rootMarkers": ["fake.root"],
+      "env": { "FAKE_CRASH_AFTER": "300" }
     }
   },
   "generalLsp.formatters": {
@@ -46,6 +76,16 @@
     "broken": {
       "command": ["sh", "-c", "exit 2"],
       "filePatterns": ["*.broken"]
+    },
+    "relative": {
+      "command": ["./upper.sh"],
+      "filePatterns": ["*.relfmt"],
+      "rootMarkers": ["fake.root"]
+    },
+    "slowfmt": {
+      "command": ["sleep", "5"],
+      "filePatterns": ["*.slowfmt"],
+      "timeout": 300
     }
   }
 }

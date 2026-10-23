@@ -1,0 +1,65 @@
+#!/usr/bin/env node
+// A minimal LSP server for tests: a static and a dynamically registered command, an optionally slow
+// initialize (FAKE_INIT_DELAY ms), and a stderr line without a trailing newline.
+const delay = Number(process.env.FAKE_INIT_DELAY ?? 0);
+let buffer = Buffer.alloc(0);
+let nextId = 1000;
+
+function send(message) {
+  const body = JSON.stringify({ jsonrpc: "2.0", ...message });
+  process.stdout.write(`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+}
+
+function handle(message) {
+  switch (message.method) {
+    case "initialize":
+      setTimeout(
+        () =>
+          send({
+            id: message.id,
+            result: {
+              capabilities: {
+                textDocumentSync: 1,
+                executeCommandProvider: { commands: ["fake.static"] },
+                workspace: { workspaceFolders: { supported: true, changeNotifications: true } },
+              },
+            },
+          }),
+        delay,
+      );
+      return;
+    case "initialized":
+      // FAKE_CRASH_AFTER makes every start crash shortly after, the way a broken server crash-loops.
+      if (process.env.FAKE_CRASH_AFTER) setTimeout(() => process.exit(3), Number(process.env.FAKE_CRASH_AFTER));
+      send({
+        id: nextId++,
+        method: "client/registerCapability",
+        params: { registrations: [{ id: "fake-dynamic", method: "workspace/executeCommand", registerOptions: { commands: ["fake.dynamic"] } }] },
+      });
+      return;
+    case "workspace/executeCommand":
+      send({ id: message.id, result: `${message.params.command}:${process.pid}` });
+      return;
+    case "shutdown":
+      send({ id: message.id, result: null });
+      return;
+    case "exit":
+      process.exit(0);
+    default:
+      if (message.id !== undefined && message.method) send({ id: message.id, result: null });
+  }
+}
+
+process.stderr.write("glsp-partial-line");
+process.stdin.on("data", (chunk) => {
+  buffer = Buffer.concat([buffer, chunk]);
+  for (;;) {
+    const header = buffer.indexOf("\r\n\r\n");
+    if (header < 0) return;
+    const length = Number(/Content-Length: (\d+)/i.exec(buffer.subarray(0, header).toString())[1]);
+    if (buffer.length < header + 4 + length) return;
+    handle(JSON.parse(buffer.subarray(header + 4, header + 4 + length).toString()));
+    buffer = buffer.subarray(header + 4 + length);
+  }
+});
+process.stdin.on("end", () => process.exit(0));
